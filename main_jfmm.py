@@ -154,8 +154,7 @@ def main(args):
         start_epoch = 0
 
     start_time = last_logging = time.time()
-    scaler = torch.cuda.amp.GradScaler()
-
+    scaler = torch.amp.GradScaler(device="cuda")
     global_step = start_epoch * len(loader)
     ckpt_interval = max(1, args.ckpt_interval) if args.ckpt_interval != 0 else 1  # default to 1 if 0 given -> but we'll respect 0 meaning every epoch
     save_every_epoch = (args.ckpt_interval == 0)
@@ -172,11 +171,10 @@ def main(args):
             y = y.cuda(gpu, non_blocking=True)
 
             lr = adjust_learning_rate(args, optimizer, loader, step)
-
+            
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type="cuda"):
                 loss = model(x, y)
-
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
