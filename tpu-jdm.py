@@ -26,7 +26,7 @@ import torch_xla.debug.metrics as met
 import tfrecord_dataset # Placeholder import for your TFRecord dataset implementation
 
 import augmentations as aug
-import resnet_tpu as resnet # Use the TPU-adapted ResNet
+import resnet as resnet # Use the TPU-adapted ResNet
 
 # --- LARS Optimizer (unchanged) ---
 def exclude_bias_and_norm(p):
