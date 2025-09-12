@@ -179,10 +179,67 @@ def adjust_learning_rate(args, optimizer, loader_len, step):
     return lr
 
 # --- Main Training Function (adapted for TPU) ---
-def _mp_fn(index, args):
-    """Multiprocess function for XLA."""
-    torch.manual_seed(42) # Set seed for reproducibility
+# Inside your main() function, before xmp.spawn
+import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 
+# Attempt to get world size (might trigger early init)
+try:
+    # Use xr.runtime_devices() if available and stable early on
+    # Otherwise, xm.xrt_world_size() might work
+    # Let's try a safer check first
+    print("Checking TPU configuration...")
+    # This might fail if TPU isn't fully ready, but let's try
+    # A common way is to get the device count after basic init
+    # We can't easily do that before spawn, so let's try getting world size
+    # inside a dummy spawn function or handle the error in _mp_fn
+
+    # For now, let's try a common heuristic or assume 1 if spawn fails
+    # A better way is often to let _mp_fn figure it out and adapt
+
+    # Let's try getting it before spawn, might fail
+    # actual_world_size = xm.xrt_world_size()
+    # But this often requires device init which might fail with the error you see
+
+    # Safer approach: Assume 1 initially, let _mp_fn detect and adapt logic if needed
+    # Or, try a very simple spawn with nprocs=1 first to test device access
+    # If that works, you know you have at least 1 core.
+
+    # Let's try to get the device count *before* spawn by forcing a minimal init
+    # This is tricky. Let's assume nprocs based on common Kaggle setups or error handling
+
+    # --- Heuristic or Default ---
+    # Often Kaggle might give a single core for testing or specific configurations
+    # Or the v3-8 but misconfigured.
+    # Let's default to 1 for now to test if the core issue is the nprocs mismatch.
+    # You can try 8 again later if you confirm full TPU access.
+    detected_nprocs = 1 # Start conservative
+    print(f"Assuming nprocs={detected_nprocs} for initial attempt.")
+
+except Exception as e:
+    print(f"Error detecting TPU world size before spawn: {e}")
+    detected_nprocs = 1 # Default fallback
+
+# --- Inside _mp_fn ---
+# Modify _mp_fn to get the *actual* world size once initialized
+def _mp_fn(index, args):
+    try:
+        device = xm.xla_device()
+        actual_world_size = xm.xrt_world_size()
+        local_ordinal = xm.get_local_ordinal()
+        ordinal = xm.get_ordinal()
+        xm.master_print(f"Process {index} on {device}, World Size: {actual_world_size}, Local Ordinal: {local_ordinal}, Global Ordinal: {ordinal}")
+
+        # --- Adjust batch size calculation based on actual world size ---
+        # Make sure your per-core batch size calculation uses the *actual* world size
+        per_core_batch_size = args.batch_size // actual_world_size
+        xm.master_print(f"Effective Batch Size: {args.batch_size}, Per-Core Batch Size: {per_core_batch_size}")
+
+        # ... rest of your _mp_fn logic using `actual_world_size` and `device` ...
+
+    except Exception as e:
+         xm.master_print(f"Error in _mp_fn process {index}: {e}")
+         raise e # Re-raise to signal failure
     # Initialize XLA distributed environment
     device = xm.xla_device()
     xm.master_print(f"Process {index} using device: {device}")
@@ -202,27 +259,41 @@ def _mp_fn(index, args):
     # --- Data Loading (adapted for TFRecords) ---
     # You need to implement `tfrecord_dataset.TFRecordImageFolderDataset`
     # This is a placeholder structure. You'll need to write the actual dataset class.
+# Inside _mp_fn(index, args):
+    
+    # --- Data Loading (adapted for TFRecords) ---
     try:
+        # Point to the correct Kaggle input directory
+        # You might need to join paths from both part-0 and part-1 if needed,
+        # or run separate jobs/processes for each part, or list files from both.
+        # For simplicity, let's assume part-0 for now:
+        kaggle_data_path = Path("/kaggle/input/imagenet-1k-tfrecords-ilsvrc2012-part-0")
+        # Or if you have combined them or are using part-1:
+        # kaggle_data_path = Path("/kaggle/input/imagenet-1k-tfrecords-ilsvrc2012-part-1")
+        # Or if Kaggle mounts them differently, check the actual path.
+    
         dataset_train = tfrecord_dataset.TFRecordImageFolderDataset(
-            data_dir=args.data_dir / "train",
-            transform=transforms,
-            # Add other necessary arguments for your TFRecord parser
+            data_dir=kaggle_data_path,
+            transform=transforms, # Your aug.TrainTransform instance
+            shuffle_buffer_size=1024 # Adjust or set to 0
         )
-        # Create a DistributedSampler-like behavior using sharding in tf.data if needed,
-        # or rely on XLA's parallel loader's sharding.
-        # PyTorch DataLoader with TFRecord dataset
+    
+        # Since it's an IterableDataset, shuffle is handled by tf.data
         loader = torch.utils.data.DataLoader(
             dataset_train,
             batch_size=args.batch_size // xm.xrt_world_size(), # Per core batch size
             num_workers=args.num_workers,
             pin_memory=False, # Not needed for TPU
-            shuffle=False, # Shuffling handled by tf.data or XLA loader if needed
-            drop_last=True # Often recommended for distributed training
+            # shuffle=True, # Not applicable for IterableDataset
+            drop_last=True # Recommended
         )
-        xm.master_print(f"Created DataLoader with {len(loader)} steps per epoch")
+        xm.master_print(f"Created DataLoader for TFRecords from {kaggle_data_path}")
+    
     except Exception as e:
-        xm.master_print(f"Error creating DataLoader: {e}")
+        xm.master_print(f"Error creating TFRecord DataLoader: {e}")
         raise e
+    
+
 
     # --- Model, Optimizer, DDP (adapted for TPU) ---
     model = FlowMatching(args).to(device)
@@ -401,7 +472,9 @@ def main():
     args = parser.parse_args()
 
     # Start distributed training using xmp.spawn
-    xmp.spawn(_mp_fn, args=(args,), nprocs=8, start_method='fork') # Adjust nprocs if needed
+    # --- In main() ---
+# Use the detected/adapted nprocs
+    xmp.spawn(_mp_fn, args=(args,), nprocs=detected_nprocs, start_method='fork')
 
 
 if __name__ == "__main__":
