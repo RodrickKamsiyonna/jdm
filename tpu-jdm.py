@@ -1,91 +1,321 @@
-# train_flowmatching_tpu.py
-# Adapted for TPU training with TFRecords
+# train_flowmatching.py
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
 
-import os
-import sys
+# MODIFICATIONS FOR KAGGLE TFRECORDS:
+# 1. Added imports for tensorflow, glob, PIL, io, and bisect.
+# 2. Added a custom Dataset class `TFRecordImageNetDataset` to read ImageNet from TFRecord files.
+# 3. Modified the `main` function to use this new dataset class instead of ImageFolder.
+# 4. The script now expects TFRecord files in the Kaggle input directory.
+#
+# NOTE: You need to have tensorflow installed: `pip install tensorflow`
+
+from pathlib import Path
 import argparse
 import json
 import math
+import os
+import sys
 import time
-from pathlib import Path
+import numpy as np
+import glob
+from PIL import Image
+import io
+from bisect import bisect_right
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.utils.utils as xu
-import torch_xla.debug.metrics as met
+from torch import nn, optim
+import torch.distributed as dist
+from torch.utils.data import Dataset
 
-# Assuming you have a way to parse TFRecords into PyTorch tensors
-# This example uses a placeholder. You'll need to implement `TFRecordImageFolderDataset`.
-# Consider using libraries like `tfrecord` or `tensorflow` directly.
-# from tfrecord_dataset import TFRecordImageFolderDataset # Placeholder import
-import tfrecord_dataset # Placeholder import for your TFRecord dataset implementation
+# Suppress TensorFlow GPU messages and warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+import tensorflow as tf
 
+# Original script's imports
 import augmentations as aug
-import resnet as resnet # Use the TPU-adapted ResNet
+from distributed import init_distributed_mode
+import resnet
 
-# --- LARS Optimizer (unchanged) ---
-def exclude_bias_and_norm(p):
-    return p.ndim == 1
+try:
+    import wandb
+    _HAS_WANDB = True
+except ImportError:
+    wandb = None
+    _HAS_WANDB = False
 
-class LARS(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr,
-        weight_decay=0,
-        momentum=0.9,
-        eta=0.001,
-        weight_decay_filter=None,
-        lars_adaptation_filter=None,
-    ):
-        defaults = dict(
-            lr=lr,
-            weight_decay=weight_decay,
-            momentum=momentum,
-            eta=eta,
-            weight_decay_filter=weight_decay_filter,
-            lars_adaptation_filter=lars_adaptation_filter,
-        )
-        super().__init__(params, defaults)
+# --- Custom Dataset for Kaggle TFRecords ---
 
-    @torch.no_grad()
-    def step(self):
-        for g in self.param_groups:
-            for p in g["params"]:
-                dp = p.grad
+class TFRecordImageNetDataset(Dataset):
+    """
+    Custom PyTorch Dataset for reading ImageNet from TFRecord files,
+    as provided in Kaggle competitions. This implementation uses lazy loading.
+    """
+    def __init__(self, file_pattern, transform=None):
+        """
+        Args:
+            file_pattern (string): Glob pattern to find the TFRecord files.
+            transform (callable, optional): Optional transform to be applied on a sample.
+        """
+        self.file_pattern = file_pattern
+        self.transform = transform
+        
+        print(f"Searching for TFRecord files with pattern: {self.file_pattern}")
+        self.files = sorted(glob.glob(self.file_pattern, recursive=True))
+        if not self.files:
+            raise FileNotFoundError(f"No files found for pattern {self.file_pattern}")
+        print(f"Found {len(self.files)} TFRecord files.")
 
-                if dp is None:
-                    continue
+        print("Indexing TFRecord files... (this may take a few minutes)")
+        # This one-time scan creates an index for fast __getitem__ access later.
+        counts = [sum(1 for _ in tf.data.TFRecordDataset(f)) for f in self.files]
+        self.cumulative_sizes = [0] + list(np.cumsum(counts))
+        self.total_records = self.cumulative_sizes[-1]
+        print(f"Indexing complete. Total images: {self.total_records}")
 
-                if g["weight_decay_filter"] is None or not g["weight_decay_filter"](p):
-                    dp = dp.add(p, alpha=g["weight_decay"])
+        # Define the feature description for parsing TFRecord Example protos.
+        self.feature_description = {
+            'image/encoded': tf.io.FixedLenFeature([], tf.string),
+            'image/class/label': tf.io.FixedLenFeature([], tf.int64),
+        }
 
-                if g["lars_adaptation_filter"] is None or not g[
-                    "lars_adaptation_filter"
-                ](p):
-                    param_norm = torch.norm(p)
-                    update_norm = torch.norm(dp)
-                    one = torch.ones_like(param_norm)
-                    q = torch.where(
-                        param_norm > 0.0,
-                        torch.where(update_norm > 0, (g["eta"] * param_norm / update_norm), one),
-                        one,
-                    )
-                    dp = dp.mul(q)
-                param_state = self.state[p]
-                if "mu" not in param_state:
-                    param_state["mu"] = torch.zeros_like(p)
-                mu = param_state["mu"]
-                mu.mul_(g["momentum"]).add_(dp)
+    def _parse_example(self, example_proto):
+        """Parses a single record from the TFRecord."""
+        parsed_features = tf.io.parse_single_example(example_proto, self.feature_description)
+        image_bytes = parsed_features['image/encoded'].numpy()
+        # The label is 1-indexed in the TFRecords, but PyTorch expects 0-indexed.
+        label = parsed_features['image/class/label'].numpy() - 1 
+        return image_bytes, label
 
-                p.add_(mu, alpha=-g["lr"])
+    def __len__(self):
+        return self.total_records
 
-# --- Model Components (unchanged, assuming they are TPU compatible) ---
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self.total_records:
+            raise IndexError("Index out of range")
+
+        # Find which file the index belongs to using the pre-computed index
+        file_idx = bisect_right(self.cumulative_sizes, idx) - 1
+        
+        # Find the index of the record within that specific file
+        idx_in_file = idx - self.cumulative_sizes[file_idx]
+
+        file_path = self.files[file_idx]
+        # tf.data.TFRecordDataset is efficient at seeking to a specific record
+        raw_record = next(iter(tf.data.TFRecordDataset(file_path).skip(idx_in_file).take(1)))
+        
+        image_bytes, label = self._parse_example(raw_record)
+
+        # Convert image bytes to a PIL Image so it can be transformed
+        image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+
+        if self.transform:
+            # The TrainTransform from the original script returns two augmented views
+            img1, img2 = self.transform(image)
+            return (img1, img2), label
+        
+        return image, label
+
+# --- End of Custom Dataset ---
+
+def get_arguments():
+    parser = argparse.ArgumentParser(description="Pretrain a resnet model with Flow Matching", add_help=False)
+
+    # Modified data-dir to be optional, as we use a hardcoded glob pattern for Kaggle.
+    parser.add_argument("--data-dir", type=Path, default=None,
+                        help="Path to the ImageNet dataset (not used if running in Kaggle with TFRecords)")
+    parser.add_argument("--exp-dir", type=Path, default="./exp",
+                        help="Path to the experiment folder, where all logs/checkpoints will be stored")
+    parser.add_argument("--log-freq-time", type=int, default=60,
+                        help="Print logs to the stats.txt file every [log-freq-time] seconds")
+    parser.add_argument("--arch", type=str, default="resnet50",
+                        help="Architecture of the backbone encoder network")
+    parser.add_argument("--projector-mlp", default="8192-8192-512",
+                        help="Size and number of layers of the MLP projector head")
+    parser.add_argument("--time-emb-dim", type=int, default=128,
+                        help="Dimension of the sinusoidal time embeddings")
+    parser.add_argument("--time-emb-mlp", default="128-512",
+                        help="MLP layers for time embedding projection")
+    parser.add_argument("--velocity-mlp", default="1536-1024-512",
+                        help="MLP layers for velocity predictor (input: 2*embedding_dim + time_emb_dim)")
+    parser.add_argument("--epochs", type=int, default=100,
+                        help="Number of epochs")
+    parser.add_argument("--batch-size", type=int, default=2048,
+                        help="Effective batch size (per worker batch size is [batch-size] / world-size)")
+    parser.add_argument("--base-lr", type=float, default=0.2,
+                        help="Base learning rate, effective learning after warmup is [base-lr] * [batch-size] / 256")
+    parser.add_argument("--wd", type=float, default=1e-6,
+                        help="Weight decay")
+    parser.add_argument("--num-workers", type=int, default=2, # Kaggle usually has 2-4 cores
+                        help="Number of dataloader workers")
+    parser.add_argument("--device", default="cuda",
+                        help="device to use for training / testing")
+    parser.add_argument("--world-size", default=1, type=int,
+                        help="number of distributed processes")
+    parser.add_argument("--local_rank", default=-1, type=int)
+    parser.add_argument("--dist-url", default="env://",
+                        help="url used to set up distributed training")
+    parser.add_argument("--wandb-project", default=None,
+                        help="W&B project name (if provided, wandb will be initialized on rank 0 after 'wandb login')")
+    parser.add_argument("--wandb-entity", default=None,
+                        help="W&B entity (team/user) if needed")
+    parser.add_argument("--ckpt-interval", type=int, default=10,
+                        help="Save a full checkpoint every N epochs (master only). 0 = save every epoch")
+
+    return parser
+
+
+def main(args):
+    torch.backends.cudnn.benchmark = True
+    init_distributed_mode(args)
+    print(args)
+    gpu = torch.device(args.device)
+
+    if args.rank == 0:
+        args.exp_dir.mkdir(parents=True, exist_ok=True)
+        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
+        print(" ".join(sys.argv), file=stats_file)
+    else:
+        stats_file = None
+
+    use_wandb = False
+    if args.rank == 0 and args.wandb_project is not None and _HAS_WANDB:
+        try:
+            wandb.init(project=args.wandb_project, entity=args.wandb_entity, config=vars(args))
+            use_wandb = True
+        except Exception as e:
+            print(f"Warning: failed to init wandb: {e}", file=sys.stderr)
+            use_wandb = False
+    elif args.wandb_project is not None and not _HAS_WANDB and args.rank == 0:
+        print("wandb requested but not installed. Install via `pip install wandb`.", file=sys.stderr)
+
+    # --- Data Loading Modification for Kaggle ---
+    transforms = aug.TrainTransform()
+
+    # Use the custom dataset for Kaggle TFRecords with the specified file pattern
+    train_file_pattern = '/kaggle/input/**/train-*-of-01024'
+    dataset = TFRecordImageNetDataset(file_pattern=train_file_pattern, transform=transforms)
+    
+    # --- End of Data Loading Modification ---
+
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
+    assert args.batch_size % args.world_size == 0
+    per_device_batch_size = args.batch_size // args.world_size
+
+    dataloader_kwargs = dict(
+        batch_size=per_device_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        sampler=sampler,
+    )
+    if args.num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = 2
+        dataloader_kwargs["persistent_workers"] = True
+
+    loader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
+
+    model = FlowMatching(args).cuda(gpu)
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, device_ids=[gpu], find_unused_parameters=False, gradient_as_bucket_view=True
+    )
+
+    optimizer = LARS(
+        model.parameters(),
+        lr=0,
+        weight_decay=args.wd,
+        weight_decay_filter=exclude_bias_and_norm,
+        lars_adaptation_filter=exclude_bias_and_norm,
+    )
+
+    if (args.exp_dir / "model.pth").is_file():
+        if args.rank == 0:
+            print("Resuming from checkpoint")
+        ckpt = torch.load(args.exp_dir / "model.pth", map_location="cpu")
+        start_epoch = ckpt.get("epoch", 0)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+    else:
+        start_epoch = 0
+
+    start_time = last_logging = time.time()
+    scaler = torch.cuda.amp.GradScaler()
+    global_step = start_epoch * len(loader)
+    save_every_epoch = (args.ckpt_interval == 0)
+    ckpt_interval = args.ckpt_interval if not save_every_epoch else 1
+
+    for epoch in range(start_epoch, args.epochs):
+        sampler.set_epoch(epoch)
+        model.train()
+
+        for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
+            x = x.cuda(gpu, non_blocking=True)
+            y = y.cuda(gpu, non_blocking=True)
+
+            lr = adjust_learning_rate(args, optimizer, loader, step)
+            
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                loss = model(x, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            global_step += 1
+
+            current_time = time.time()
+            if args.rank == 0 and current_time - last_logging > args.log_freq_time:
+                stats = dict(
+                    epoch=epoch,
+                    step=step,
+                    loss=loss.item(),
+                    time=int(current_time - start_time),
+                    lr=lr,
+                )
+                print(json.dumps(stats), file=stats_file if stats_file else sys.stdout)
+                
+                if use_wandb:
+                    try:
+                        wandb.log({"batch_loss": stats["loss"], "lr": lr}, step=global_step)
+                    except Exception as e:
+                        print(f"Warning: wandb.log failed: {e}", file=sys.stderr)
+                last_logging = current_time
+
+        if args.rank == 0:
+            should_save = save_every_epoch or ((epoch + 1) % ckpt_interval == 0)
+            if should_save:
+                state = dict(
+                    epoch=epoch + 1,
+                    model=model.state_dict(),
+                    optimizer=optimizer.state_dict(),
+                )
+                torch.save(state, args.exp_dir / "model.pth")
+    
+    if args.rank == 0:
+        torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
+
+# --- All functions and classes below this line are identical to the original script ---
+
+def adjust_learning_rate(args, optimizer, loader, step):
+    max_steps = args.epochs * len(loader)
+    warmup_steps = 10 * len(loader)
+    base_lr = args.base_lr * args.batch_size / 256
+    if step < warmup_steps:
+        lr = base_lr * step / warmup_steps
+    else:
+        step_adj = step - warmup_steps
+        max_steps_adj = max_steps - warmup_steps
+        q = 0.5 * (1 + math.cos(math.pi * step_adj / max_steps_adj))
+        end_lr = base_lr * 0.001
+        lr = base_lr * q + end_lr * (1 - q)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+    return lr
+
+
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -94,37 +324,43 @@ class SinusoidalTimeEmbedding(nn.Module):
     def forward(self, t):
         device = t.device
         half_dim = self.dim // 2
-        emb_scale = math.log(10000) / (half_dim - 1) # Use math.log
+        emb_scale = math.log(10000) / (half_dim - 1)
         freqs = torch.exp(torch.arange(half_dim, device=device) * -emb_scale)
-        embeddings = t * freqs
+        embeddings = t.squeeze(-1)[:, None] * freqs[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
+
 
 def build_mlp(spec, last_layer_bias=False):
     layers = []
     f = list(map(int, spec.split("-")))
     for i in range(len(f) - 2):
         layers.append(nn.Linear(f[i], f[i + 1]))
-        # BatchNorm1d might need adjustment for TPU, but often works
         layers.append(nn.BatchNorm1d(f[i + 1]))
         layers.append(nn.ReLU(True))
     layers.append(nn.Linear(f[-2], f[-1], bias=last_layer_bias))
     return nn.Sequential(*layers)
 
+
 class FlowMatching(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.backbone, self.embedding = resnet.__dict__[args.arch](
-            zero_init_residual=True
-        )
+        self.backbone, self.embedding = resnet.__dict__[args.arch](zero_init_residual=True)
 
-        self.projection_head = build_mlp(args.projector_mlp)
+        projector_spec = f"{self.embedding}-{args.projector_mlp}"
+        self.projection_head = build_mlp(projector_spec)
 
+        time_proj_spec = f"{args.time_emb_dim}-{args.time_emb_mlp}"
         self.time_embedding = SinusoidalTimeEmbedding(dim=args.time_emb_dim)
-        self.time_projection = build_mlp(args.time_emb_mlp)
+        self.time_projection = build_mlp(time_proj_spec)
 
-        self.velocity_predictor = build_mlp(args.velocity_mlp)
+        time_emb_output_dim = int(args.time_emb_mlp.split('-')[-1])
+        projector_output_dim = int(args.projector_mlp.split('-')[-1])
+        
+        velocity_input_dim = self.embedding + projector_output_dim + time_emb_output_dim
+        velocity_spec = f"{velocity_input_dim}-{args.velocity_mlp}"
+        self.velocity_predictor = build_mlp(velocity_spec, last_layer_bias=True)
 
     def forward(self, x, y):
         feat_x = self.backbone(x)
@@ -161,321 +397,63 @@ class FlowMatching(nn.Module):
         loss = F.mse_loss(preds, truths)
         return loss
 
-# --- Learning Rate Scheduler (unchanged) ---
-def adjust_learning_rate(args, optimizer, loader_len, step):
-    max_steps = args.epochs * loader_len
-    warmup_steps = 10 * loader_len
-    base_lr = args.base_lr * args.batch_size / 256
-    if step < warmup_steps:
-        lr = base_lr * step / warmup_steps
-    else:
-        step_adj = step - warmup_steps
-        max_steps_adj = max_steps - warmup_steps
-        q = 0.5 * (1 + math.cos(math.pi * step_adj / max_steps_adj))
-        end_lr = base_lr * 0.001
-        lr = base_lr * q + end_lr * (1 - q)
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
-    return lr
 
-# --- Main Training Function (adapted for TPU) ---
-# Inside your main() function, before xmp.spawn
-import torch_xla.core.xla_model as xm
-import torch_xla.runtime as xr
+def exclude_bias_and_norm(p):
+    return p.ndim == 1
 
-# Attempt to get world size (might trigger early init)
-try:
-    # Use xr.runtime_devices() if available and stable early on
-    # Otherwise, xm.xrt_world_size() might work
-    # Let's try a safer check first
-    print("Checking TPU configuration...")
-    # This might fail if TPU isn't fully ready, but let's try
-    # A common way is to get the device count after basic init
-    # We can't easily do that before spawn, so let's try getting world size
-    # inside a dummy spawn function or handle the error in _mp_fn
 
-    # For now, let's try a common heuristic or assume 1 if spawn fails
-    # A better way is often to let _mp_fn figure it out and adapt
-
-    # Let's try getting it before spawn, might fail
-    # actual_world_size = xm.xrt_world_size()
-    # But this often requires device init which might fail with the error you see
-
-    # Safer approach: Assume 1 initially, let _mp_fn detect and adapt logic if needed
-    # Or, try a very simple spawn with nprocs=1 first to test device access
-    # If that works, you know you have at least 1 core.
-
-    # Let's try to get the device count *before* spawn by forcing a minimal init
-    # This is tricky. Let's assume nprocs based on common Kaggle setups or error handling
-
-    # --- Heuristic or Default ---
-    # Often Kaggle might give a single core for testing or specific configurations
-    # Or the v3-8 but misconfigured.
-    # Let's default to 1 for now to test if the core issue is the nprocs mismatch.
-    # You can try 8 again later if you confirm full TPU access.
-    detected_nprocs = 1 # Start conservative
-    print(f"Assuming nprocs={detected_nprocs} for initial attempt.")
-
-except Exception as e:
-    print(f"Error detecting TPU world size before spawn: {e}")
-    detected_nprocs = 1 # Default fallback
-
-# --- Inside _mp_fn ---
-# Modify _mp_fn to get the *actual* world size once initialized
-def _mp_fn(index, args):
-    try:
-        device = xm.xla_device()
-        actual_world_size = xm.xrt_world_size()
-        local_ordinal = xm.get_local_ordinal()
-        ordinal = xm.get_ordinal()
-        xm.master_print(f"Process {index} on {device}, World Size: {actual_world_size}, Local Ordinal: {local_ordinal}, Global Ordinal: {ordinal}")
-
-        # --- Adjust batch size calculation based on actual world size ---
-        # Make sure your per-core batch size calculation uses the *actual* world size
-        per_core_batch_size = args.batch_size // actual_world_size
-        xm.master_print(f"Effective Batch Size: {args.batch_size}, Per-Core Batch Size: {per_core_batch_size}")
-
-        # ... rest of your _mp_fn logic using `actual_world_size` and `device` ...
-
-    except Exception as e:
-         xm.master_print(f"Error in _mp_fn process {index}: {e}")
-         raise e # Re-raise to signal failure
-    # Initialize XLA distributed environment
-    device = xm.xla_device()
-    xm.master_print(f"Process {index} using device: {device}")
-
-    # Setup experiment directory (only on master)
-    if xm.is_master_ordinal():
-        args.exp_dir.mkdir(parents=True, exist_ok=True)
-        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-        xm.master_print(" ".join(sys.argv))
-        xm.master_print(" ".join(sys.argv), file=stats_file)
-    else:
-        stats_file = None
-
-    # Transforms (assuming they are TPU compatible)
-    transforms = aug.TrainTransform()
-
-    # --- Data Loading (adapted for TFRecords) ---
-    # You need to implement `tfrecord_dataset.TFRecordImageFolderDataset`
-    # This is a placeholder structure. You'll need to write the actual dataset class.
-# Inside _mp_fn(index, args):
-    
-    # --- Data Loading (adapted for TFRecords) ---
-    try:
-        # Point to the correct Kaggle input directory
-        # You might need to join paths from both part-0 and part-1 if needed,
-        # or run separate jobs/processes for each part, or list files from both.
-        # For simplicity, let's assume part-0 for now:
-        kaggle_data_path = Path("/kaggle/input/imagenet-1k-tfrecords-ilsvrc2012-part-0")
-        # Or if you have combined them or are using part-1:
-        # kaggle_data_path = Path("/kaggle/input/imagenet-1k-tfrecords-ilsvrc2012-part-1")
-        # Or if Kaggle mounts them differently, check the actual path.
-    
-        dataset_train = tfrecord_dataset.TFRecordImageFolderDataset(
-            data_dir=kaggle_data_path,
-            transform=transforms, # Your aug.TrainTransform instance
-            shuffle_buffer_size=1024 # Adjust or set to 0
+class LARS(optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr,
+        weight_decay=0,
+        momentum=0.9,
+        eta=0.001,
+        weight_decay_filter=None,
+        lars_adaptation_filter=None,
+    ):
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            eta=eta,
+            weight_decay_filter=weight_decay_filter,
+            lars_adaptation_filter=lars_adaptation_filter,
         )
-    
-        # Since it's an IterableDataset, shuffle is handled by tf.data
-        loader = torch.utils.data.DataLoader(
-            dataset_train,
-            batch_size=args.batch_size // xm.xrt_world_size(), # Per core batch size
-            num_workers=args.num_workers,
-            pin_memory=False, # Not needed for TPU
-            # shuffle=True, # Not applicable for IterableDataset
-            drop_last=True # Recommended
-        )
-        xm.master_print(f"Created DataLoader for TFRecords from {kaggle_data_path}")
-    
-    except Exception as e:
-        xm.master_print(f"Error creating TFRecord DataLoader: {e}")
-        raise e
-    
+        super().__init__(params, defaults)
 
+    @torch.no_grad()
+    def step(self):
+        for g in self.param_groups:
+            for p in g["params"]:
+                dp = p.grad
+                if dp is None:
+                    continue
 
-    # --- Model, Optimizer, DDP (adapted for TPU) ---
-    model = FlowMatching(args).to(device)
-    # SyncBatchNorm might behave differently on TPU. Test carefully.
-    # model = nn.SyncBatchNorm.convert_sync_batchnorm(model) # Might not be needed or behave differently
+                if g["weight_decay_filter"] is None or not g["weight_decay_filter"](p):
+                    dp = dp.add(p, alpha=g["weight_decay"])
 
-    optimizer = LARS(
-        model.parameters(),
-        lr=0, # Initial LR will be set by adjust_learning_rate
-        weight_decay=args.wd,
-        weight_decay_filter=exclude_bias_and_norm,
-        lars_adaptation_filter=exclude_bias_and_norm,
-    )
-
-    # Resume from checkpoint logic (adapted for TPU)
-    start_epoch = 0
-    if (args.exp_dir / "model.pth").is_file():
-        xm.master_print("Resuming from checkpoint...")
-        # Load checkpoint on CPU first, then move to device
-        ckpt = torch.load(args.exp_dir / "model.pth", map_location='cpu')
-        start_epoch = ckpt.get("epoch", 0)
-        # Use strict=False if you have issues with keys (e.g., from SyncBatchNorm)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        xm.master_print(f"Resumed from epoch {start_epoch}")
-
-    # Wrap model for XLA DDP
-    model = torch_xla.distributed.parallel_loader.MpModelWrapper(model)
-
-    # --- Training Loop ---
-    start_time = last_logging = time.time()
-    global_step = start_epoch * len(loader)
-
-    # Use ParallelLoader for efficient data loading on TPU
-    loader = pl.ParallelLoader(loader, [device])
-
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        para_loader = loader.per_device_loader(device)
-        xm.master_print(f"Starting epoch {epoch}")
-
-        epoch_loss_sum = 0.0
-        epoch_steps = 0
-
-        for step, ((x, y), _) in enumerate(para_loader): # Iterate over parallel loader
-            x = x.to(device)
-            y = y.to(device)
-
-            lr = adjust_learning_rate(args, optimizer, len(loader), global_step)
-
-            optimizer.zero_grad()
-            # AMP might not be directly applicable or needed on TPU as XLA handles it.
-            # If needed, investigate torch_xla.amp or XLA-specific mixed precision settings.
-            # with torch.amp.autocast(device_type="xla"): # Might not be supported or necessary
-            loss = model(x, y) # Call the wrapped model
-
-            loss.backward()
-            # Use XLA's optimizer step instead of scaler.step
-            xm.optimizer_step(optimizer) # This handles the XLA device transfer and step
-
-            # Reduce loss across replicas for logging (optional but good practice)
-            reduced_loss = xm.mesh_reduce('loss_reduce', loss, lambda x: sum(x) / len(x))
-
-            batch_loss = reduced_loss.item()
-            epoch_loss_sum += batch_loss
-            epoch_steps += 1
-            global_step += 1
-
-            # Logging (only on master)
-            if xm.is_master_ordinal():
-                batch_stats = dict(
-                    epoch=epoch,
-                    step=step,
-                    global_step=global_step,
-                    batch_loss=batch_loss, # Use reduced loss for logging
-                    time=int(time.time() - start_time),
-                    lr=lr,
-                )
-                xm.master_print(json.dumps(batch_stats))
-                if stats_file is not None:
-                    xm.master_print(json.dumps(batch_stats), file=stats_file)
-
-                current_time = time.time()
-                if current_time - last_logging > args.log_freq_time:
-                    xm.master_print(json.dumps(batch_stats)) # Log periodically
-                    if stats_file is not None:
-                        xm.master_print(json.dumps(batch_stats), file=stats_file)
-                    last_logging = current_time
-
-        # Epoch end logic (only on master)
-        if xm.is_master_ordinal():
-            avg_epoch_loss = epoch_loss_sum / max(1, epoch_steps)
-            epoch_stats = dict(
-                epoch=epoch,
-                epoch_loss=avg_epoch_loss,
-                steps=epoch_steps,
-                time=int(time.time() - start_time),
-            )
-            xm.master_print("EPOCH_SUMMARY: " + json.dumps(epoch_stats))
-            if stats_file is not None:
-                xm.master_print("EPOCH_SUMMARY: " + json.dumps(epoch_stats), file=stats_file)
-
-            # Save checkpoint (only on master, every N epochs or at the end)
-            should_save = ((epoch + 1) % max(1, args.ckpt_interval) == 0) or (epoch == args.epochs - 1)
-            if should_save:
-                xm.master_print(f"Saving checkpoint at epoch {epoch + 1}")
-                # Get the underlying model state dict
-                model_state = model._model.state_dict() # Access the actual model inside MpModelWrapper
-                state = dict(
-                    epoch=epoch + 1,
-                    model=model_state,
-                    optimizer=optimizer.state_dict(),
-                )
-                ckpt_path = args.exp_dir / "model.pth"
-                # Save from master process only
-                xm.save(state, ckpt_path, master_only=True)
-                xm.master_print(f"Checkpoint saved to {ckpt_path}")
-
-    # Final save (only on master)
-    if xm.is_master_ordinal():
-        xm.master_print("Saving final checkpoint")
-        final_model_state = model._model.state_dict()
-        final_state = dict(
-            epoch=args.epochs,
-            model=final_model_state,
-            optimizer=optimizer.state_dict(),
-        )
-        final_ckpt_path = args.exp_dir / "model_final.pth"
-        xm.save(final_state, final_ckpt_path, master_only=True)
-        xm.master_print(f"Final checkpoint saved to {final_ckpt_path}")
-
-        # Save backbone weights
-        backbone_path = args.exp_dir / f"{args.arch}.pth"
-        xm.save(model._model.backbone.state_dict(), backbone_path, master_only=True)
-        xm.master_print(f"Backbone weights saved to {backbone_path}")
-
-    # Print XLA metrics (optional, useful for debugging)
-    # xm.master_print(met.metrics_report())
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Pretrain a resnet model with Flow Matching on TPU", add_help=False)
-
-    # Arguments (mostly unchanged)
-    parser.add_argument("--data-dir", type=Path, default="/path/to/imagenet", required=True,
-                        help="Path to the dataset folder containing /train")
-    parser.add_argument("--exp-dir", type=Path, default="./exp_tpu",
-                        help="Path to the experiment folder")
-    parser.add_argument("--log-freq-time", type=int, default=60,
-                        help="Print logs every [log-freq-time] seconds")
-    parser.add_argument("--arch", type=str, default="resnet50",
-                        help="Architecture")
-    parser.add_argument("--projector-mlp", default="8192-8192-512",
-                        help="Projector MLP")
-    parser.add_argument("--time-emb-dim", type=int, default=128,
-                        help="Time embedding dim")
-    parser.add_argument("--time-emb-mlp", default="128-512",
-                        help="Time embedding MLP")
-    parser.add_argument("--velocity-mlp", default="1536-1024-512", # Check input dim calculation
-                        help="Velocity predictor MLP")
-    parser.add_argument("--epochs", type=int, default=100,
-                        help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=2048, # Effective batch size
-                        help="Effective batch size (total across all cores)")
-    parser.add_argument("--base-lr", type=float, default=0.2,
-                        help="Base learning rate, scaled by batch size / 256")
-    parser.add_argument("--wd", type=float, default=1e-6,
-                        help="Weight decay")
-    parser.add_argument("--num-workers", type=int, default=4, # Reduce for TPU if needed
-                        help="Number of dataloader workers")
-
-    # TPU specific arguments (can be passed via xmp.spawn or environment)
-    # These might be handled by xmp.spawn automatically
-    # parser.add_argument("--num_cores", type=int, default=8) # Usually set by TPU runtime
-
-    args = parser.parse_args()
-
-    # Start distributed training using xmp.spawn
-    # --- In main() ---
-# Use the detected/adapted nprocs
-    xmp.spawn(_mp_fn, args=(args,), nprocs=detected_nprocs, start_method='fork')
+                if g["lars_adaptation_filter"] is None or not g["lars_adaptation_filter"](p):
+                    param_norm = torch.norm(p)
+                    update_norm = torch.norm(dp)
+                    one = torch.ones_like(param_norm)
+                    q = torch.where(
+                        param_norm > 0.0,
+                        torch.where(update_norm > 0, (g["eta"] * param_norm / update_norm), one),
+                        one,
+                    )
+                    dp = dp.mul(q)
+                
+                param_state = self.state[p]
+                if "mu" not in param_state:
+                    param_state["mu"] = torch.zeros_like(p)
+                mu = param_state["mu"]
+                mu.mul_(g["momentum"]).add_(dp)
+                p.add_(mu, alpha=-g["lr"])
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser("Flow Matching training script", parents=[get_arguments()])
+    args = parser.parse_args()
+    main(args)
