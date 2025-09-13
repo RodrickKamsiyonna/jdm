@@ -77,20 +77,12 @@ class HuggingFaceImageNetDataset(IterableDataset):
                 token=True
             )
 
-        # Synchronize all processes. The other processes will wait here until
-        # the main process has finished the step above.
-        dist.barrier()
-
-        print(f"Rank {dist.get_rank()} is loading dataset stream from cache...")
-        # Now all processes can safely load the dataset. It will be loaded from cache
-        # for ranks > 0, avoiding the race condition.
         self.dataset = datasets.load_dataset(
             self.hf_dataset_name,
             split=self.split,
             streaming=True,
             token=True,
         )
-        print(f"Rank {dist.get_rank()} stream initialized successfully.")
         # --- END OF FIX ---
 
     def __iter__(self):
