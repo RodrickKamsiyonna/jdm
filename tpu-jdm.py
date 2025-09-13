@@ -16,7 +16,7 @@
 
 from pathlib import Path
 import argparse
-import json
+import json 
 import math
 import os
 import sys
@@ -425,6 +425,7 @@ class FlowMatching(nn.Module):
         feat_x, feat_y = self.backbone(x), self.backbone(y)
         target_x, target_y = feat_x.detach(), feat_y.detach()
         context_x, context_y = self.projection_head(feat_x), self.projection_head(feat_y)
+        
         y_0 = torch.randn_like(target_y)
         t = torch.rand(target_y.shape[0], 1, device=target_y.device)
         y_t = t * target_y + (1 - t) * y_0
@@ -432,6 +433,7 @@ class FlowMatching(nn.Module):
         t_emb = self.time_embedding(t)
         t_emb_proj = self.time_projection(t_emb)
         pred_velocity_xy = self.velocity_predictor(torch.cat([y_t, context_x, t_emb_proj], dim=1))
+        
         y_0_b = torch.randn_like(target_x)
         t_b = torch.rand(target_x.shape[0], 1, device=target_x.device)
         y_t_b = t_b * target_x + (1 - t_b) * y_0_b
@@ -439,6 +441,7 @@ class FlowMatching(nn.Module):
         t_emb_b = self.time_embedding(t_b)
         t_emb_proj_b = self.time_projection(t_emb_b)
         pred_velocity_yx = self.velocity_predictor(torch.cat([y_t_b, context_y, t_emb_proj_b], dim=1))
+        
         preds = torch.cat([pred_velocity_xy, pred_velocity_yx], dim=0)
         truths = torch.cat([true_velocity_xy, true_velocity_yx], dim=0)
         return F.mse_loss(preds, truths)
