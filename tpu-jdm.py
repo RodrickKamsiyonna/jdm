@@ -83,14 +83,6 @@ class HuggingFaceImageNetDataset(IterableDataset):
                 streaming=True,
                 token=True
             )
-            # Add barrier after main process finishes initial setup
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
-        else:
-            # Non-main processes wait for the main process to finish setup
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
-            print(f"Process (rank {dist.get_rank()}) waiting for dataset initialization...")
 
         self.dataset = datasets.load_dataset(
             self.hf_dataset_name,
