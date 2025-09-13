@@ -10,7 +10,10 @@
 #    - Only the main process (rank 0) will now perform the initial dataset setup.
 #    - A `torch.distributed.barrier()` is used to make other processes wait,
 #      preventing them from failing while the dataset is being initialized.
-#
+# 3. Fixed the NCCL warning by explicitly setting the device ID in the DDP setup.
+# 4. Ensured the model and data are moved to the correct GPU device consistently.
+# 5. Removed unused imports and variables.
+
 # NOTE: You need to have the datasets library installed: `pip install datasets`
 #       and be logged in to Hugging Face: `huggingface-cli login`
 
@@ -169,7 +172,8 @@ def main(args):
     torch.backends.cudnn.benchmark = True
     init_distributed_mode(args)
     print(args)
-    gpu = torch.device(args.device)
+    # --- FIX: Explicitly set the GPU device ID to prevent NCCL warnings ---
+    gpu = torch.device(f"cuda:{args.gpu}") # Use args.gpu which is set by init_distributed_mode
 
     if args.rank == 0:
         args.exp_dir.mkdir(parents=True, exist_ok=True)
@@ -219,10 +223,11 @@ def main(args):
     if args.rank == 0:
         print(f"Using an estimated {steps_per_epoch} steps per epoch.")
 
-    model = FlowMatching(args).cuda(gpu)
+    model = FlowMatching(args).to(gpu) # Move model to the correct GPU device
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    # --- FIX: Pass the device_ids argument to DDP to specify the GPU ---
     model = torch.nn.parallel.DistributedDataParallel(
-        model, device_ids=[gpu], find_unused_parameters=False, gradient_as_bucket_view=True
+        model, device_ids=[args.gpu], find_unused_parameters=False, gradient_as_bucket_view=True
     )
 
     optimizer = LARS(
@@ -262,8 +267,9 @@ def main(args):
             global_step = epoch * steps_per_epoch + step
             # --- End of Fix ---
 
-            x = x.cuda(gpu, non_blocking=True)
-            y = y.cuda(gpu, non_blocking=True)
+            # --- FIX: Move data to the correct GPU device ---
+            x = x.to(gpu, non_blocking=True)
+            y = y.to(gpu, non_blocking=True)
 
             # --- FIX: Pass steps_per_epoch instead of loader ---
             lr = adjust_learning_rate(args, optimizer, steps_per_epoch, global_step)
