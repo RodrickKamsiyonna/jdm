@@ -56,7 +56,7 @@ class HuggingFaceImageNetDataset(IterableDataset):
     Custom PyTorch IterableDataset for streaming ImageNet from the Hugging Face Hub.
     This is memory-efficient as it doesn't download the whole dataset at once.
     """
-    def __init__(self, hf_dataset_name, split, key, transform=None):
+    def __init__(self, hf_dataset_name, split, transform=None):
         """
         Args:
             hf_dataset_name (string): Name of the dataset on Hugging Face Hub.
@@ -72,7 +72,7 @@ class HuggingFaceImageNetDataset(IterableDataset):
             hf_dataset_name, 
             split=split, 
             streaming=True, 
-            use_auth_token=key
+            use_auth_token=True
         )
         print("Dataset stream initialized successfully.")
 
@@ -144,8 +144,6 @@ def get_arguments():
                         help="W&B entity (team/user) if needed")
     parser.add_argument("--ckpt-interval", type=int, default=10,
                         help="Save a full checkpoint every N epochs (master only). 0 = save every epoch")
-    parser.add_argument("--key", default="key",
-                        help="Save a full checkpoint every N epochs (master only). 0 = save every epoch")
     return parser
 
 
@@ -181,7 +179,6 @@ def main(args):
         hf_dataset_name="timm/imagenet-1k-wds",
         split="train",
         transform=transforms,
-        key=args.key
     )
     
     # IterableDatasets do not use a sampler for distributed training.
