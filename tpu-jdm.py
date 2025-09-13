@@ -226,7 +226,7 @@ def main(args):
 
     start_time = last_logging = time.time()
     scaler = torch.amp.GradScaler(device="cuda")
-    global_step = start_epoch * len(loader)
+    global_step = start_epoch * steps_per_epoch
     ckpt_interval = max(1, args.ckpt_interval) if args.ckpt_interval != 0 else 1  # default to 1 if 0 given -> but we'll respect 0 meaning every epoch
     save_every_epoch = (args.ckpt_interval == 0)
 
