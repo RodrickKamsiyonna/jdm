@@ -48,49 +48,15 @@ except ImportError:
     _HAS_WANDB = False
 
 # --- Custom Dataset for Hugging Face Streaming ---
-
 class HuggingFaceImageNetDataset(IterableDataset):
     """
     Custom PyTorch IterableDataset for streaming ImageNet from the Hugging Face Hub.
-    Includes a synchronization barrier to prevent race conditions during initialization
-    in a distributed training setup.
+    The dataset loading is handled in the main function to prevent distributed race conditions.
     """
-    def __init__(self, hf_dataset_name, split, transform=None, is_main_process=False, dataset_size=None):
-        """
-        Args:
-            hf_dataset_name (string): Name of the dataset on Hugging Face Hub.
-            split (string): The dataset split to use (e.g., 'train').
-            transform (callable, optional): Optional transform to be applied on a sample.
-            is_main_process (bool): Flag to indicate if this is the main process (rank 0).
-            dataset_size (int, optional): Known size of the dataset for calculating steps/epoch.
-                                          If None, a default ImageNet size is used.
-        """
+    def __init__(self, hf_dataset, transform=None, dataset_size=None):
         self.transform = transform
-        self.hf_dataset_name = hf_dataset_name
-        self.split = split
-        # Store the dataset size for calculating steps per epoch
+        self.dataset = hf_dataset
         self.dataset_size = dataset_size if dataset_size is not None else 1281167 # Default ImageNet size
-
-        # --- DISTRIBUTED TRAINING FIX ---
-        # Let only the main process handle the initial dataset setup. This prevents
-        # a race condition where multiple processes try to download/prepare metadata
-        # simultaneously, which can cause failures on non-main processes.
-        if is_main_process:
-            print(f"Main process (rank 0) is initializing dataset '{self.hf_dataset_name}'...")
-            datasets.load_dataset(
-                self.hf_dataset_name,
-                split=self.split,
-                streaming=True,
-                token=True
-            )
-
-        self.dataset = datasets.load_dataset(
-            self.hf_dataset_name,
-            split=self.split,
-            streaming=True,
-            token=True,
-        )
-        # --- END OF FIX ---
 
     def __iter__(self):
         # The 'datasets' library automatically handles sharding for multiple workers.
@@ -110,6 +76,9 @@ class HuggingFaceImageNetDataset(IterableDataset):
                 yield (img1, img2), label
             else:
                 yield image, label
+
+    def get_dataset_size(self):
+        return self.dataset_size
 
     # Optional: Provide a way to get the estimated size if needed elsewhere
     def get_dataset_size(self):
@@ -164,8 +133,8 @@ def main(args):
     torch.backends.cudnn.benchmark = True
     init_distributed_mode(args)
     print(args)
-    # --- FIX: Explicitly set the GPU device ID to prevent NCCL warnings ---
-    gpu = torch.device(f"cuda:{args.gpu}") # Use args.gpu which is set by init_distributed_mode
+    
+    gpu = torch.device(f"cuda:{args.gpu}")
 
     if args.rank == 0:
         args.exp_dir.mkdir(parents=True, exist_ok=True)
@@ -187,14 +156,40 @@ def main(args):
     # --- Data Loading Modification for Hugging Face ---
     transforms = aug.TrainTransform()
 
+    # --- DISTRIBUTED TRAINING FIX: Move dataset loading outside of class init ---
+    # Only the main process loads the dataset first to avoid a race condition.
+    if args.rank == 0:
+        print(f"Main process (rank 0) is initializing and loading dataset...")
+        hf_dataset = datasets.load_dataset(
+            "timm/imagenet-1k-wds",
+            split="train",
+            streaming=True,
+            token=True
+        )
+    else:
+        hf_dataset = None
+
+    # Wait for the main process to complete the initial load.
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        # After the barrier, all processes can now safely load the dataset
+        if args.rank != 0:
+            hf_dataset = datasets.load_dataset(
+                "timm/imagenet-1k-wds",
+                split="train",
+                streaming=True,
+                token=True,
+            )
+
+    # Now, pass the loaded dataset to the custom class constructor
     dataset = HuggingFaceImageNetDataset(
-        hf_dataset_name="timm/imagenet-1k-wds",
-        split="train",
+        hf_dataset=hf_dataset,
         transform=transforms,
-        is_main_process=(args.rank == 0), # Pass the flag here
         dataset_size=1281167 # Pass the known size
     )
+    # --- End of Fix ---
     
+    # Rest of your main function remains the same
     assert args.batch_size % args.world_size == 0
     per_device_batch_size = args.batch_size // args.world_size
 
@@ -208,7 +203,7 @@ def main(args):
         dataloader_kwargs["persistent_workers"] = True
 
     loader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
-
+    
     # Use the dataset size stored in the dataset object or the default
     imagenet_train_size = dataset.get_dataset_size()
     steps_per_epoch = math.ceil(imagenet_train_size / args.batch_size)
