@@ -54,6 +54,7 @@ class TrainTransform(object):
                 GaussianBlur(p=1.0),
                 Solarization(p=0.0),
                 transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.repeat(3,1,1) if x.size(0)==1 else x),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
                 ),
@@ -77,6 +78,7 @@ class TrainTransform(object):
                 GaussianBlur(p=0.1),
                 Solarization(p=0.2),
                 transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.repeat(3,1,1) if x.size(0)==1 else x),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
                 ),
