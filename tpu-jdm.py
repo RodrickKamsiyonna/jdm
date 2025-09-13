@@ -52,17 +52,21 @@ class HuggingFaceImageNetDataset(IterableDataset):
     Includes a synchronization barrier to prevent race conditions during initialization
     in a distributed training setup.
     """
-    def __init__(self, hf_dataset_name, split, transform=None, is_main_process=False):
+    def __init__(self, hf_dataset_name, split, transform=None, is_main_process=False, dataset_size=None):
         """
         Args:
             hf_dataset_name (string): Name of the dataset on Hugging Face Hub.
             split (string): The dataset split to use (e.g., 'train').
             transform (callable, optional): Optional transform to be applied on a sample.
             is_main_process (bool): Flag to indicate if this is the main process (rank 0).
+            dataset_size (int, optional): Known size of the dataset for calculating steps/epoch.
+                                          If None, a default ImageNet size is used.
         """
         self.transform = transform
         self.hf_dataset_name = hf_dataset_name
         self.split = split
+        # Store the dataset size for calculating steps per epoch
+        self.dataset_size = dataset_size if dataset_size is not None else 1281167 # Default ImageNet size
 
         # --- DISTRIBUTED TRAINING FIX ---
         # Let only the main process handle the initial dataset setup. This prevents
@@ -76,6 +80,14 @@ class HuggingFaceImageNetDataset(IterableDataset):
                 streaming=True,
                 token=True
             )
+            # Add barrier after main process finishes initial setup
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+        else:
+            # Non-main processes wait for the main process to finish setup
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            print(f"Process (rank {dist.get_rank()}) waiting for dataset initialization...")
 
         self.dataset = datasets.load_dataset(
             self.hf_dataset_name,
@@ -103,6 +115,11 @@ class HuggingFaceImageNetDataset(IterableDataset):
                 yield (img1, img2), label
             else:
                 yield image, label
+
+    # Optional: Provide a way to get the estimated size if needed elsewhere
+    def get_dataset_size(self):
+        return self.dataset_size
+
 # --- End of Custom Dataset ---
 
 def get_arguments():
@@ -178,7 +195,8 @@ def main(args):
         hf_dataset_name="timm/imagenet-1k-wds",
         split="train",
         transform=transforms,
-        is_main_process=(args.rank == 0) # Pass the flag here
+        is_main_process=(args.rank == 0), # Pass the flag here
+        dataset_size=1281167 # Pass the known size
     )
     
     assert args.batch_size % args.world_size == 0
@@ -195,7 +213,8 @@ def main(args):
 
     loader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
-    imagenet_train_size = 1281167
+    # Use the dataset size stored in the dataset object or the default
+    imagenet_train_size = dataset.get_dataset_size()
     steps_per_epoch = math.ceil(imagenet_train_size / args.batch_size)
     if args.rank == 0:
         print(f"Using an estimated {steps_per_epoch} steps per epoch.")
@@ -226,8 +245,9 @@ def main(args):
 
     start_time = last_logging = time.time()
     scaler = torch.amp.GradScaler(device="cuda")
-    global_step = start_epoch * steps_per_epoch
-    ckpt_interval = max(1, args.ckpt_interval) if args.ckpt_interval != 0 else 1  # default to 1 if 0 given -> but we'll respect 0 meaning every epoch
+    # global_step will be calculated manually now
+    # global_step = start_epoch * steps_per_epoch
+    ckpt_interval = max(1, args.ckpt_interval) if args.ckpt_interval != 0 else 1
     save_every_epoch = (args.ckpt_interval == 0)
 
     for epoch in range(start_epoch, args.epochs):
@@ -236,11 +256,18 @@ def main(args):
         epoch_loss_sum = 0.0
         epoch_steps = 0
 
-        for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
+        # --- FIX: Removed start=... from enumerate and manage global_step manually ---
+        for step, ((x, y), _) in enumerate(loader):
+            # --- Calculate global_step manually ---
+            global_step = epoch * steps_per_epoch + step
+            # --- End of Fix ---
+
             x = x.cuda(gpu, non_blocking=True)
             y = y.cuda(gpu, non_blocking=True)
 
-            lr = adjust_learning_rate(args, optimizer, loader, step)
+            # --- FIX: Pass steps_per_epoch instead of loader ---
+            lr = adjust_learning_rate(args, optimizer, steps_per_epoch, global_step)
+            # --- End of Fix ---
             
             optimizer.zero_grad()
             with torch.amp.autocast(device_type="cuda"):
@@ -252,7 +279,7 @@ def main(args):
             batch_loss = loss.item()
             epoch_loss_sum += batch_loss
             epoch_steps += 1
-            global_step += 1
+            # global_step is now managed manually
 
             batch_stats = dict(
                 epoch=epoch,
@@ -270,6 +297,7 @@ def main(args):
 
                 if use_wandb:
                     try:
+                        # Use the manually calculated global_step
                         wandb.log({"batch_loss": batch_loss, "lr": lr, "epoch": epoch, "step": step}, step=global_step)
                     except Exception as e:
                         print(f"Warning: wandb.log failed: {e}", file=sys.stderr)
@@ -303,6 +331,7 @@ def main(args):
 
             if use_wandb:
                 try:
+                    # Use the manually calculated global_step for epoch end log
                     wandb.log({"epoch_loss": avg_epoch_loss, "epoch": epoch}, step=global_step)
                 except Exception as e:
                     print(f"Warning: wandb.log failed at epoch end: {e}", file=sys.stderr)
@@ -318,6 +347,7 @@ def main(args):
                 torch.save(state, ckpt_path)
 
     if args.rank == 0:
+        # Save final checkpoint using the last global_step
         final_ckpt_path = args.exp_dir / "model_final.pth"
         final_state = dict(
             epoch=args.epochs,
@@ -334,10 +364,12 @@ def main(args):
             except Exception:
                 pass
 
-def adjust_learning_rate(args, optimizer, steps_per_epoch, step):
+# --- FIX: Ensure adjust_learning_rate uses steps_per_epoch correctly ---
+def adjust_learning_rate(args, optimizer, steps_per_epoch, global_step): # Changed parameter name for clarity
     max_steps = args.epochs * steps_per_epoch
     warmup_steps = 10 * steps_per_epoch
     base_lr = args.base_lr * args.batch_size / 256
+    step = global_step # Use the passed global_step
     if step < warmup_steps:
         lr = base_lr * step / warmup_steps
     else:
@@ -349,6 +381,7 @@ def adjust_learning_rate(args, optimizer, steps_per_epoch, step):
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
     return lr
+# --- End of Fix ---
 
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim):
