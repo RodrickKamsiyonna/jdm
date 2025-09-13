@@ -98,21 +98,19 @@ class HuggingFaceImageNetDataset(IterableDataset):
         for sample in self.dataset:
             # Based on the dataset structure for 'timm/imagenet-1k-wds':
             # image data is in 'jpg', label is in 'cls'.
-            image_bytes = sample['jpg']
+            image = sample['jpg']  # This is already a PIL Image
             label = sample['cls']
             
-            try:
-                image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-            except Exception as e:
-                print(f"Warning: Rank {dist.get_rank()} could not open image, skipping. Error: {e}", file=sys.stderr)
+            # Ensure it's a PIL Image
+            if not isinstance(image, Image.Image):
+                print(f"Warning: Rank {dist.get_rank() if dist.is_available() and dist.is_initialized() else 'N/A'} unexpected image type {type(image)}, skipping.", file=sys.stderr)
                 continue
-
+    
             if self.transform:
                 img1, img2 = self.transform(image)
                 yield (img1, img2), label
             else:
                 yield image, label
-
 # --- End of Custom Dataset ---
 
 def get_arguments():
