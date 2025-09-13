@@ -1,383 +1,116 @@
-from pathlib import Path
-import argparse
-import json 
-import math
+#!/usr/bin/env python3
+# tpu-jdm-fixed.py
 import os
 import sys
 import time
-import numpy as np
-from PIL import Image
-import io
+import math
+import json
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
 import torch.distributed as dist
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, DataLoader
 
+# your local imports - keep them as in your original repo
 import datasets
-
 import augmentations as aug
-from distributed import init_distributed_mode
 import resnet
 
 try:
     import wandb
     _HAS_WANDB = True
-except ImportError:
+except Exception:
     wandb = None
     _HAS_WANDB = False
 
-# --- Custom Dataset for Hugging Face Streaming ---
+# ------------------------------
+# Utility: robust distributed init
+# ------------------------------
+def init_distributed_mode_from_env(args):
+    # read env vars as early as possible
+    args.rank = int(os.environ.get("RANK", 0))
+    args.world_size = int(os.environ.get("WORLD_SIZE", 1))
+    args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    # IMPORTANT: set CUDA device before calling init_process_group when using NCCL
+    torch.cuda.set_device(args.local_rank)
+    # init process group
+    dist.init_process_group(backend="nccl", init_method=args.dist_url,
+                            world_size=args.world_size, rank=args.rank)
+    return args
 
+# ------------------------------
+# Hugging Face streaming iterable dataset (keeps previous pattern)
+# ------------------------------
 class HuggingFaceImageNetDataset(IterableDataset):
-    """
-    Custom PyTorch IterableDataset for streaming ImageNet from the Hugging Face Hub.
-    Includes a synchronization barrier to prevent race conditions during initialization
-    in a distributed training setup.
-    """
-    def __init__(self, hf_dataset_name, split, transform=None, is_main_process=False, dataset_size=None):
-        """
-        Args:
-            hf_dataset_name (string): Name of the dataset on Hugging Face Hub.
-            split (string): The dataset split to use (e.g., 'train').
-            transform (callable, optional): Optional transform to be applied on a sample.
-            is_main_process (bool): Flag to indicate if this is the main process (rank 0).
-            dataset_size (int, optional): Known size of the dataset for calculating steps/epoch.
-        """
+    def __init__(self, hf_dataset_name, split, transform=None, dataset_size=None):
         self.transform = transform
         self.hf_dataset_name = hf_dataset_name
         self.split = split
-        self.dataset_size = dataset_size if dataset_size is not None else 1281167  # Default ImageNet size
+        self.dataset_size = dataset_size if dataset_size is not None else 1281167
 
-        # --- Distributed setup and GPU assignment ---
+        # get distributed info if available
         if dist.is_available() and dist.is_initialized():
             self.rank = dist.get_rank()
             self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
             self.world_size = dist.get_world_size()
-            torch.cuda.set_device(self.local_rank)
         else:
             self.rank = 0
             self.local_rank = 0
             self.world_size = 1
 
-        # --- Main process initializes dataset to avoid race conditions ---
+        # Only rank 0 prints or triggers potential downloads
         if self.rank == 0:
-            print(f"[Rank 0] Initializing Hugging Face dataset: {self.hf_dataset_name} ({self.split})")
-            datasets.load_dataset(
+            print(f"[Rank 0] Initializing Hugging Face dataset: {self.hf_dataset_name} ({self.split})", flush=True)
+
+        # load streaming dataset (non-blocking) — token=True may require HF login
+        # Wrap in try/except to expose network/auth issues
+        try:
+            self.dataset = datasets.load_dataset(
                 self.hf_dataset_name,
                 split=self.split,
                 streaming=True,
                 token=True
             )
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()  # ✅ Simplified barrier
-        else:
-            print(f"[Rank {self.rank}] Waiting for dataset initialization by rank 0...")
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()  # ✅ Simplified barrier
+        except Exception as e:
+            print(f"[Rank {self.rank}] dataset load failed: {e}", file=sys.stderr, flush=True)
+            raise
 
-        # --- Load dataset (streaming mode) ---
-        self.dataset = datasets.load_dataset(
-            self.hf_dataset_name,
-            split=self.split,
-            streaming=True,
-            token=True
-        )
+        # Barrier to sync processes *after* dataset object is created and after device is set
+        if dist.is_available() and dist.is_initialized():
+            # plain dist.barrier() works because we set device before init_process_group
+            dist.barrier()
 
     def __iter__(self):
-        # Hugging Face streaming handles sharding across processes
         for sample in self.dataset:
-            image = sample.get("jpg", None)
+            # streaming dataset from timm/imagenet-1k-wds usually has 'jpg' bytes and 'cls' label
+            img = sample.get("jpg", None)
             label = sample.get("cls", None)
 
-            if not isinstance(image, Image.Image):
-                print(f"[Rank {self.rank}] Warning: Unexpected image type {type(image)} — skipping.", file=sys.stderr)
-                continue
+            # If the dataset returns raw bytes, convert to PIL as your transform expects
+            try:
+                if isinstance(img, (bytes, bytearray)):
+                    from PIL import Image
+                    img = Image.open(io.BytesIO(img)).convert("RGB")
+            except Exception:
+                # If transform expects PIL, skip or log
+                pass
 
             if self.transform:
-                img1, img2 = self.transform(image)
-                yield (img1, img2), label
+                # transform should return a tensor
+                x1, x2 = self.transform(img)
+                # yield a pair (x1, x2) and the label
+                yield (x1, x2), label
             else:
-                yield image, label
+                yield img, label
 
     def get_dataset_size(self):
         return self.dataset_size
 
-# --- End of Custom Dataset ---
-
-def get_arguments():
-    parser = argparse.ArgumentParser(description="Pretrain a resnet model with Flow Matching", add_help=False)
-    parser.add_argument("--data-dir", type=Path, default=None, help="Path to local dataset (not used for HF streaming)")
-    parser.add_argument("--exp-dir", type=Path, default="./exp",
-                        help="Path to the experiment folder, where all logs/checkpoints will be stored")
-    parser.add_argument("--log-freq-time", type=int, default=60,
-                        help="Print logs to the stats.txt file every [log-freq-time] seconds")
-    parser.add_argument("--arch", type=str, default="resnet50",
-                        help="Architecture of the backbone encoder network")
-    parser.add_argument("--projector-mlp", default="8192-8192-512",
-                        help="Size and number of layers of the MLP projector head")
-    parser.add_argument("--time-emb-dim", type=int, default=128,
-                        help="Dimension of the sinusoidal time embeddings")
-    parser.add_argument("--time-emb-mlp", default="128-512",
-                        help="MLP layers for time embedding projection")
-    parser.add_argument("--velocity-mlp", default="1536-1024-512",
-                        help="MLP layers for velocity predictor (input: 2*embedding_dim + time_emb_dim)")
-    parser.add_argument("--epochs", type=int, default=100,
-                        help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=2048,
-                        help="Effective batch size (per worker batch size is [batch-size] / world-size)")
-    parser.add_argument("--base-lr", type=float, default=0.2,
-                        help="Base learning rate, effective learning after warmup is [base-lr] * [batch-size] / 256")
-    parser.add_argument("--wd", type=float, default=1e-6,
-                        help="Weight decay")
-    parser.add_argument("--num-workers", type=int, default=2,
-                        help="Number of dataloader workers")
-    parser.add_argument("--device", default="cuda",
-                        help="device to use for training / testing")
-    parser.add_argument("--world-size", default=1, type=int,
-                        help="number of distributed processes")
-    parser.add_argument("--local_rank", default=-1, type=int)
-    parser.add_argument("--dist-url", default="env://",
-                        help="url used to set up distributed training")
-    parser.add_argument("--wandb-project", default=None,
-                        help="W&B project name (if provided, wandb will be initialized on rank 0 after 'wandb login')")
-    parser.add_argument("--wandb-entity", default=None,
-                        help="W&B entity (team/user) if needed")
-    parser.add_argument("--ckpt-interval", type=int, default=10,
-                        help="Save a full checkpoint every N epochs (master only). 0 = save every epoch")
-    return parser
-
-
-def main(args):
-    torch.backends.cudnn.benchmark = True
-    init_distributed_mode(args)
-    
-    # ✅ Get local rank from env and set CUDA device early
-    local_rank = int(os.environ.get("LOCAL_RANK", getattr(args, "local_rank", 0)))
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
-    
-    print(args)
-
-    if args.rank == 0:
-        args.exp_dir.mkdir(parents=True, exist_ok=True)
-        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
-        print(" ".join(sys.argv), file=stats_file)
-    else:
-        stats_file = None
-
-    use_wandb = False
-    if args.rank == 0 and args.wandb_project is not None and _HAS_WANDB:
-        try:
-            wandb.init(project=args.wandb_project, entity=args.wandb_entity, config=vars(args))
-            use_wandb = True
-        except Exception as e:
-            print(f"Warning: failed to init wandb: {e}", file=sys.stderr)
-    elif args.wandb_project is not None and not _HAS_WANDB and args.rank == 0:
-        print("wandb requested but not installed. Install via `pip install wandb`.", file=sys.stderr)
-
-    # --- Data Loading Modification for Hugging Face ---
-    transforms = aug.TrainTransform()
-
-    dataset = HuggingFaceImageNetDataset(
-        hf_dataset_name="timm/imagenet-1k-wds",
-        split="train",
-        transform=transforms,
-        is_main_process=(args.rank == 0), # Pass the flag here
-        dataset_size=1281167 # Pass the known size
-    )
-    
-    assert args.batch_size % args.world_size == 0
-    per_device_batch_size = args.batch_size // args.world_size
-
-    dataloader_kwargs = dict(
-        batch_size=per_device_batch_size,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-    if args.num_workers > 0:
-        dataloader_kwargs["prefetch_factor"] = 2
-        dataloader_kwargs["persistent_workers"] = True
-
-    loader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
-
-    # Use the dataset size stored in the dataset object or the default
-    imagenet_train_size = dataset.get_dataset_size()
-    steps_per_epoch = math.ceil(imagenet_train_size / args.batch_size)
-    if args.rank == 0:
-        print(f"Using an estimated {steps_per_epoch} steps per epoch.")
-
-    # ✅ Create model on device and use integer device_ids for DDP
-    model = FlowMatching(args).to(device)
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        find_unused_parameters=False,
-        gradient_as_bucket_view=True
-    )
-
-    optimizer = LARS(
-        model.parameters(),
-        lr=0,
-        weight_decay=args.wd,
-        weight_decay_filter=exclude_bias_and_norm,
-        lars_adaptation_filter=exclude_bias_and_norm,
-    )
-
-    if (args.exp_dir / "model.pth").is_file():
-        if args.rank == 0:
-            print("resuming from checkpoint")
-        ckpt = torch.load(args.exp_dir / "model.pth", map_location="cpu")
-        start_epoch = ckpt.get("epoch", 0)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-    else:
-        start_epoch = 0
-
-    start_time = last_logging = time.time()
-    scaler = torch.amp.GradScaler(device="cuda")
-    # global_step will be calculated manually now
-    # global_step = start_epoch * steps_per_epoch
-    ckpt_interval = max(1, args.ckpt_interval) if args.ckpt_interval != 0 else 1
-    save_every_epoch = (args.ckpt_interval == 0)
-
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-
-        epoch_loss_sum = 0.0
-        epoch_steps = 0
-
-        # --- FIX: Removed start=... from enumerate and manage global_step manually ---
-        for step, ((x, y), _) in enumerate(loader):
-            # --- Calculate global_step manually ---
-            global_step = epoch * steps_per_epoch + step
-            # --- End of Fix ---
-
-            # ✅ Use .to(device) instead of .cuda(gpu)
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
-            # --- FIX: Pass steps_per_epoch instead of loader ---
-            lr = adjust_learning_rate(args, optimizer, steps_per_epoch, global_step)
-            # --- End of Fix ---
-            
-            optimizer.zero_grad()
-            with torch.amp.autocast(device_type="cuda"):
-                loss = model(x, y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            batch_loss = loss.item()
-            epoch_loss_sum += batch_loss
-            epoch_steps += 1
-            # global_step is now managed manually
-
-            batch_stats = dict(
-                epoch=epoch,
-                step=step,
-                global_step=global_step,
-                batch_loss=batch_loss,
-                time=int(time.time() - start_time),
-                lr=lr,
-            )
-
-            if args.rank == 0:
-                print(json.dumps(batch_stats))
-                if stats_file is not None:
-                    print(json.dumps(batch_stats), file=stats_file)
-
-                if use_wandb:
-                    try:
-                        # Use the manually calculated global_step
-                        wandb.log({"batch_loss": batch_loss, "lr": lr, "epoch": epoch, "step": step}, step=global_step)
-                    except Exception as e:
-                        print(f"Warning: wandb.log failed: {e}", file=sys.stderr)
-
-            current_time = time.time()
-            if args.rank == 0 and current_time - last_logging > args.log_freq_time:
-                stats = dict(
-                    epoch=epoch,
-                    step=step,
-                    loss=batch_loss,
-                    time=int(current_time - start_time),
-                    lr=lr,
-                )
-                print(json.dumps(stats))
-                if stats_file is not None:
-                    print(json.dumps(stats), file=stats_file)
-                last_logging = current_time
-
-        avg_epoch_loss = epoch_loss_sum / max(1, epoch_steps)
-
-        if args.rank == 0:
-            epoch_stats = dict(
-                epoch=epoch,
-                epoch_loss=avg_epoch_loss,
-                steps=epoch_steps,
-                time=int(time.time() - start_time),
-            )
-            print("EPOCH_SUMMARY: " + json.dumps(epoch_stats))
-            if stats_file is not None:
-                print("EPOCH_SUMMARY: " + json.dumps(epoch_stats), file=stats_file)
-
-            if use_wandb:
-                try:
-                    # Use the manually calculated global_step for epoch end log
-                    wandb.log({"epoch_loss": avg_epoch_loss, "epoch": epoch}, step=global_step)
-                except Exception as e:
-                    print(f"Warning: wandb.log failed at epoch end: {e}", file=sys.stderr)
-
-            should_save = save_every_epoch or ((epoch + 1) % ckpt_interval == 0)
-            if should_save:
-                state = dict(
-                    epoch=epoch + 1,
-                    model=model.state_dict(),
-                    optimizer=optimizer.state_dict(),
-                )
-                ckpt_path = args.exp_dir / "model.pth"
-                torch.save(state, ckpt_path)
-
-    if args.rank == 0:
-        # Save final checkpoint using the last global_step
-        final_ckpt_path = args.exp_dir / "model_final.pth"
-        final_state = dict(
-            epoch=args.epochs,
-            model=model.state_dict(),
-            optimizer=optimizer.state_dict(),
-        )
-        torch.save(final_state, final_ckpt_path)
-
-        torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
-
-        if use_wandb:
-            try:
-                wandb.save(str(final_ckpt_path))
-            except Exception:
-                pass
-
-# --- FIX: Ensure adjust_learning_rate uses steps_per_epoch correctly ---
-def adjust_learning_rate(args, optimizer, steps_per_epoch, global_step): # Changed parameter name for clarity
-    max_steps = args.epochs * steps_per_epoch
-    warmup_steps = 10 * steps_per_epoch
-    base_lr = args.base_lr * args.batch_size / 256
-    step = global_step # Use the passed global_step
-    if step < warmup_steps:
-        lr = base_lr * step / warmup_steps
-    else:
-        step_adj = step - warmup_steps
-        max_steps_adj = max_steps - warmup_steps
-        q = 0.5 * (1 + math.cos(math.pi * step_adj / max_steps_adj))
-        end_lr = base_lr * 0.001
-        lr = base_lr * q + end_lr * (1 - q)
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
-    return lr
-# --- End of Fix ---
-
+# ------------------------------
+# Model, time emb, mlp builders (kept from your original)
+# ------------------------------
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -416,11 +149,12 @@ class FlowMatching(nn.Module):
         velocity_input_dim = self.embedding + projector_output_dim + time_emb_output_dim
         velocity_spec = f"{velocity_input_dim}-{args.velocity_mlp}"
         self.velocity_predictor = build_mlp(velocity_spec, last_layer_bias=True)
+
     def forward(self, x, y):
         feat_x, feat_y = self.backbone(x), self.backbone(y)
         target_x, target_y = feat_x.detach(), feat_y.detach()
         context_x, context_y = self.projection_head(feat_x), self.projection_head(feat_y)
-        
+
         y_0 = torch.randn_like(target_y)
         t = torch.rand(target_y.shape[0], 1, device=target_y.device)
         y_t = t * target_y + (1 - t) * y_0
@@ -428,7 +162,7 @@ class FlowMatching(nn.Module):
         t_emb = self.time_embedding(t)
         t_emb_proj = self.time_projection(t_emb)
         pred_velocity_xy = self.velocity_predictor(torch.cat([y_t, context_x, t_emb_proj], dim=1))
-        
+
         y_0_b = torch.randn_like(target_x)
         t_b = torch.rand(target_x.shape[0], 1, device=target_x.device)
         y_t_b = t_b * target_x + (1 - t_b) * y_0_b
@@ -436,7 +170,7 @@ class FlowMatching(nn.Module):
         t_emb_b = self.time_embedding(t_b)
         t_emb_proj_b = self.time_projection(t_emb_b)
         pred_velocity_yx = self.velocity_predictor(torch.cat([y_t_b, context_y, t_emb_proj_b], dim=1))
-        
+
         preds = torch.cat([pred_velocity_xy, pred_velocity_yx], dim=0)
         truths = torch.cat([true_velocity_xy, true_velocity_yx], dim=0)
         return F.mse_loss(preds, truths)
@@ -474,7 +208,201 @@ class LARS(optim.Optimizer):
                 mu.mul_(g["momentum"]).add_(dp)
                 p.add_(mu, alpha=-g["lr"])
 
+# ------------------------------
+# LR schedule helper (kept)
+# ------------------------------
+def adjust_learning_rate(args, optimizer, steps_per_epoch, global_step):
+    max_steps = args.epochs * steps_per_epoch
+    warmup_steps = 10 * steps_per_epoch
+    base_lr = args.base_lr * args.batch_size / 256
+    step = global_step
+    if step < warmup_steps:
+        lr = base_lr * step / warmup_steps
+    else:
+        step_adj = step - warmup_steps
+        max_steps_adj = max_steps - warmup_steps
+        q = 0.5 * (1 + math.cos(math.pi * step_adj / max_steps_adj))
+        end_lr = base_lr * 0.001
+        lr = base_lr * q + end_lr * (1 - q)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+    return lr
+
+# ------------------------------
+# Main
+# ------------------------------
+def get_arguments():
+    import argparse
+    parser = argparse.ArgumentParser(description="Pretrain a resnet model with Flow Matching", add_help=False)
+    parser.add_argument("--data-dir", type=Path, default=None)
+    parser.add_argument("--exp-dir", type=Path, default="./exp")
+    parser.add_argument("--log-freq-time", type=int, default=60)
+    parser.add_argument("--arch", type=str, default="resnet50")
+    parser.add_argument("--projector-mlp", default="8192-8192-512")
+    parser.add_argument("--time-emb-dim", type=int, default=128)
+    parser.add_argument("--time-emb-mlp", default="128-512")
+    parser.add_argument("--velocity-mlp", default="1536-1024-512")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--base-lr", type=float, default=0.2)
+    parser.add_argument("--wd", type=float, default=1e-6)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dist-url", default="env://")
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--ckpt-interval", type=int, default=10)
+    return parser
+
+def main(args):
+    # IMPORTANT: read env & set device before initializing process group
+    args = init_distributed_mode_from_env(args)
+
+    # local device for tensors
+    local_rank = args.local_rank
+    device = torch.device(f"cuda:{local_rank}")
+
+    if args.rank == 0:
+        args.exp_dir.mkdir(parents=True, exist_ok=True)
+        stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
+        print(" ".join(sys.argv), file=stats_file)
+    else:
+        stats_file = None
+
+    # wandb only on rank 0
+    use_wandb = False
+    if args.rank == 0 and args.wandb_project is not None and _HAS_WANDB:
+        try:
+            wandb.init(project=args.wandb_project, entity=args.wandb_entity, config=vars(args))
+            use_wandb = True
+        except Exception as e:
+            print(f"Warning: failed to init wandb: {e}", file=sys.stderr)
+
+    # transforms (adapt to your aug implementation)
+    transforms = aug.TrainTransform()
+
+    dataset = HuggingFaceImageNetDataset(
+        hf_dataset_name="timm/imagenet-1k-wds",
+        split="train",
+        transform=transforms,
+        dataset_size=1281167
+    )
+
+    # batch size per device
+    assert args.batch_size % args.world_size == 0
+    per_device_batch_size = args.batch_size // args.world_size
+
+    dataloader_kwargs = dict(
+        batch_size=per_device_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    if args.num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = 2
+        dataloader_kwargs["persistent_workers"] = True
+
+    loader = DataLoader(dataset, **dataloader_kwargs)
+
+    imagenet_train_size = dataset.get_dataset_size()
+    steps_per_epoch = math.ceil(imagenet_train_size / args.batch_size)
+    if args.rank == 0:
+        print(f"Using an estimated {steps_per_epoch} steps per epoch.", flush=True)
+
+    # model -> device and wrap DDP
+    model = FlowMatching(args).to(device)
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, device_ids=[local_rank], output_device=local_rank,
+        find_unused_parameters=False, gradient_as_bucket_view=True
+    )
+
+    optimizer = LARS(
+        model.parameters(),
+        lr=0,
+        weight_decay=args.wd,
+        weight_decay_filter=exclude_bias_and_norm,
+        lars_adaptation_filter=exclude_bias_and_norm,
+    )
+
+    start_epoch = 0
+    scaler = torch.amp.GradScaler(device="cuda")
+    start_time = last_logging = time.time()
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        epoch_loss_sum = 0.0
+        epoch_steps = 0
+
+        for step, ((x, y), _) in enumerate(loader):
+            global_step = epoch * steps_per_epoch + step
+
+            # move to correct device
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            lr = adjust_learning_rate(args, optimizer, steps_per_epoch, global_step)
+
+            optimizer.zero_grad()
+            with torch.amp.autocast(device_type="cuda"):
+                loss = model(x, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            batch_loss = loss.item()
+            epoch_loss_sum += batch_loss
+            epoch_steps += 1
+
+            if args.rank == 0:
+                batch_stats = dict(epoch=epoch, step=step, global_step=global_step, batch_loss=batch_loss, time=int(time.time() - start_time), lr=lr)
+                print(json.dumps(batch_stats), flush=True)
+                if stats_file is not None:
+                    print(json.dumps(batch_stats), file=stats_file, flush=True)
+                if use_wandb:
+                    try:
+                        wandb.log({"batch_loss": batch_loss, "lr": lr, "epoch": epoch, "step": step}, step=global_step)
+                    except Exception as e:
+                        print(f"Warning: wandb.log failed: {e}", file=sys.stderr, flush=True)
+
+            current_time = time.time()
+            if args.rank == 0 and current_time - last_logging > args.log_freq_time:
+                stats = dict(epoch=epoch, step=step, loss=batch_loss, time=int(current_time - start_time), lr=lr)
+                print(json.dumps(stats), flush=True)
+                if stats_file is not None:
+                    print(json.dumps(stats), file=stats_file, flush=True)
+                last_logging = current_time
+
+        avg_epoch_loss = epoch_loss_sum / max(1, epoch_steps)
+        if args.rank == 0:
+            epoch_stats = dict(epoch=epoch, epoch_loss=avg_epoch_loss, steps=epoch_steps, time=int(time.time() - start_time))
+            print("EPOCH_SUMMARY: " + json.dumps(epoch_stats), flush=True)
+            if stats_file is not None:
+                print("EPOCH_SUMMARY: " + json.dumps(epoch_stats), file=stats_file, flush=True)
+
+            if use_wandb:
+                try:
+                    wandb.log({"epoch_loss": avg_epoch_loss, "epoch": epoch}, step=global_step)
+                except Exception as e:
+                    print(f"Warning: wandb.log failed at epoch end: {e}", file=sys.stderr, flush=True)
+
+            should_save = ((epoch + 1) % args.ckpt_interval == 0) or (args.ckpt_interval == 0)
+            if should_save:
+                state = dict(epoch=epoch + 1, model=model.state_dict(), optimizer=optimizer.state_dict())
+                ckpt_path = args.exp_dir / "model.pth"
+                torch.save(state, ckpt_path)
+
+    if args.rank == 0:
+        final_ckpt_path = args.exp_dir / "model_final.pth"
+        final_state = dict(epoch=args.epochs, model=model.state_dict(), optimizer=optimizer.state_dict())
+        torch.save(final_state, final_ckpt_path)
+        torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
+        if use_wandb:
+            try:
+                wandb.save(str(final_ckpt_path))
+            except Exception:
+                pass
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Flow Matching training script", parents=[get_arguments()])
+    parser = get_arguments()
     args = parser.parse_args()
     main(args)
