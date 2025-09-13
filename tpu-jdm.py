@@ -4,13 +4,18 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-# MODIFICATIONS FOR KAGGLE TFRECORDS:
-# 1. Added imports for tensorflow, glob, PIL, io, and bisect.
-# 2. Added a custom Dataset class `TFRecordImageNetDataset` to read ImageNet from TFRecord files.
-# 3. Modified the `main` function to use this new dataset class instead of ImageFolder.
-# 4. The script now expects TFRecord files in the Kaggle input directory.
+# MODIFICATIONS FOR HUGGING FACE STREAMING:
+# 1. Removed all imports and dependencies for tensorflow, glob, and bisect.
+# 2. Added imports for the `datasets` library.
+# 3. Replaced the custom TFRecord Dataset with `HuggingFaceImageNetDataset`,
+#    an IterableDataset that streams data directly from the Hugging Face Hub.
+# 4. Modified the `main` function to use this new dataset class.
+# 5. Removed the DistributedSampler, as it's not used with IterableDatasets.
+# 6. Manually calculated `steps_per_epoch` since streaming datasets have no length.
+# 7. Adjusted the learning rate scheduler and training loop to use the manual step count.
 #
-# NOTE: You need to have tensorflow installed: `pip install tensorflow`
+# NOTE: You need to have the datasets library installed: `pip install datasets`
+#       and be logged in to Hugging Face: `huggingface-cli login`
 
 from pathlib import Path
 import argparse
@@ -20,20 +25,17 @@ import os
 import sys
 import time
 import numpy as np
-import glob
 from PIL import Image
 import io
-from bisect import bisect_right
 
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
 import torch.distributed as dist
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset # Changed from Dataset to IterableDataset
 
-# Suppress TensorFlow GPU messages and warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-import tensorflow as tf
+# Import for Hugging Face streaming
+import datasets
 
 # Original script's imports
 import augmentations as aug
@@ -47,86 +49,64 @@ except ImportError:
     wandb = None
     _HAS_WANDB = False
 
-# --- Custom Dataset for Kaggle TFRecords ---
+# --- Custom Dataset for Hugging Face Streaming ---
 
-class TFRecordImageNetDataset(Dataset):
+class HuggingFaceImageNetDataset(IterableDataset):
     """
-    Custom PyTorch Dataset for reading ImageNet from TFRecord files,
-    as provided in Kaggle competitions. This implementation uses lazy loading.
+    Custom PyTorch IterableDataset for streaming ImageNet from the Hugging Face Hub.
+    This is memory-efficient as it doesn't download the whole dataset at once.
     """
-    def __init__(self, file_pattern, transform=None):
+    def __init__(self, hf_dataset_name, split, transform=None):
         """
         Args:
-            file_pattern (string): Glob pattern to find the TFRecord files.
+            hf_dataset_name (string): Name of the dataset on Hugging Face Hub.
+            split (string): The dataset split to use (e.g., 'train').
             transform (callable, optional): Optional transform to be applied on a sample.
         """
-        self.file_pattern = file_pattern
         self.transform = transform
         
-        print(f"Searching for TFRecord files with pattern: {self.file_pattern}")
-        self.files = sorted(glob.glob(self.file_pattern, recursive=True))
-        if not self.files:
-            raise FileNotFoundError(f"No files found for pattern {self.file_pattern}")
-        print(f"Found {len(self.files)} TFRecord files.")
+        print(f"Streaming dataset '{hf_dataset_name}' (split: {split}) from Hugging Face Hub...")
+        # `use_auth_token=True` is needed for gated datasets like this one.
+        # It will automatically use your logged-in credentials from huggingface-cli.
+        self.dataset = datasets.load_dataset(
+            hf_dataset_name, 
+            split=split, 
+            streaming=True, 
+            use_auth_token=True
+        )
+        print("Dataset stream initialized successfully.")
 
-        print("Indexing TFRecord files... (this may take a few minutes)")
-        # This one-time scan creates an index for fast __getitem__ access later.
-        counts = [sum(1 for _ in tf.data.TFRecordDataset(f)) for f in self.files]
-        self.cumulative_sizes = [0] + list(np.cumsum(counts))
-        self.total_records = self.cumulative_sizes[-1]
-        print(f"Indexing complete. Total images: {self.total_records}")
+    def __iter__(self):
+        # The 'datasets' library automatically handles sharding for multiple workers
+        # when used with a PyTorch DataLoader.
+        for sample in self.dataset:
+            # Based on the dataset structure for 'timm/imagenet-1k-wds':
+            # image data is in the 'jpg' field as bytes.
+            # label is in the 'cls' field as an integer.
+            image_bytes = sample['jpg']
+            label = sample['cls']
+            
+            # Convert image bytes to a PIL Image so it can be transformed
+            try:
+                image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+            except Exception as e:
+                print(f"Warning: Could not open image, skipping. Error: {e}", file=sys.stderr)
+                continue
 
-        # Define the feature description for parsing TFRecord Example protos.
-        self.feature_description = {
-            'image/encoded': tf.io.FixedLenFeature([], tf.string),
-            'image/class/label': tf.io.FixedLenFeature([], tf.int64),
-        }
-
-    def _parse_example(self, example_proto):
-        """Parses a single record from the TFRecord."""
-        parsed_features = tf.io.parse_single_example(example_proto, self.feature_description)
-        image_bytes = parsed_features['image/encoded'].numpy()
-        # The label is 1-indexed in the TFRecords, but PyTorch expects 0-indexed.
-        label = parsed_features['image/class/label'].numpy() - 1 
-        return image_bytes, label
-
-    def __len__(self):
-        return self.total_records
-
-    def __getitem__(self, idx):
-        if idx < 0 or idx >= self.total_records:
-            raise IndexError("Index out of range")
-
-        # Find which file the index belongs to using the pre-computed index
-        file_idx = bisect_right(self.cumulative_sizes, idx) - 1
-        
-        # Find the index of the record within that specific file
-        idx_in_file = idx - self.cumulative_sizes[file_idx]
-
-        file_path = self.files[file_idx]
-        # tf.data.TFRecordDataset is efficient at seeking to a specific record
-        raw_record = next(iter(tf.data.TFRecordDataset(file_path).skip(idx_in_file).take(1)))
-        
-        image_bytes, label = self._parse_example(raw_record)
-
-        # Convert image bytes to a PIL Image so it can be transformed
-        image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-
-        if self.transform:
-            # The TrainTransform from the original script returns two augmented views
-            img1, img2 = self.transform(image)
-            return (img1, img2), label
-        
-        return image, label
+            if self.transform:
+                # The TrainTransform from the original script returns two augmented views
+                img1, img2 = self.transform(image)
+                yield (img1, img2), label
+            else:
+                yield image, label
 
 # --- End of Custom Dataset ---
 
 def get_arguments():
     parser = argparse.ArgumentParser(description="Pretrain a resnet model with Flow Matching", add_help=False)
 
-    # Modified data-dir to be optional, as we use a hardcoded glob pattern for Kaggle.
-    parser.add_argument("--data-dir", type=Path, default=None,
-                        help="Path to the ImageNet dataset (not used if running in Kaggle with TFRecords)")
+    # data-dir is no longer needed for streaming
+    parser.add_argument("--data-dir", type=Path, default=None, help="Path to local dataset (not used for HF streaming)")
     parser.add_argument("--exp-dir", type=Path, default="./exp",
                         help="Path to the experiment folder, where all logs/checkpoints will be stored")
     parser.add_argument("--log-freq-time", type=int, default=60,
@@ -149,7 +129,7 @@ def get_arguments():
                         help="Base learning rate, effective learning after warmup is [base-lr] * [batch-size] / 256")
     parser.add_argument("--wd", type=float, default=1e-6,
                         help="Weight decay")
-    parser.add_argument("--num-workers", type=int, default=2, # Kaggle usually has 2-4 cores
+    parser.add_argument("--num-workers", type=int, default=2,
                         help="Number of dataloader workers")
     parser.add_argument("--device", default="cuda",
                         help="device to use for training / testing")
@@ -192,16 +172,18 @@ def main(args):
     elif args.wandb_project is not None and not _HAS_WANDB and args.rank == 0:
         print("wandb requested but not installed. Install via `pip install wandb`.", file=sys.stderr)
 
-    # --- Data Loading Modification for Kaggle ---
+    # --- Data Loading Modification for Hugging Face ---
     transforms = aug.TrainTransform()
 
-    # Use the custom dataset for Kaggle TFRecords with the specified file pattern
-    train_file_pattern = '/kaggle/input/**/train-*-of-01024'
-    dataset = TFRecordImageNetDataset(file_pattern=train_file_pattern, transform=transforms)
+    # Use the new dataset for Hugging Face streaming
+    dataset = HuggingFaceImageNetDataset(
+        hf_dataset_name="timm/imagenet-1k-wds",
+        split="train",
+        transform=transforms
+    )
     
-    # --- End of Data Loading Modification ---
-
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
+    # IterableDatasets do not use a sampler for distributed training.
+    # Shuffling and sharding is handled by the `datasets` library internally.
     assert args.batch_size % args.world_size == 0
     per_device_batch_size = args.batch_size // args.world_size
 
@@ -209,13 +191,20 @@ def main(args):
         batch_size=per_device_batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
-        sampler=sampler,
     )
     if args.num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = 2
         dataloader_kwargs["persistent_workers"] = True
 
     loader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
+
+    # Since streaming datasets have no len(), we must define steps_per_epoch manually
+    # for the LR scheduler and training loop. ImageNet-1k has 1,281,167 training images.
+    imagenet_train_size = 1281167
+    steps_per_epoch = math.ceil(imagenet_train_size / args.batch_size)
+    print(f"Using an estimated {steps_per_epoch} steps per epoch.")
+    
+    # --- End of Data Loading Modification ---
 
     model = FlowMatching(args).cuda(gpu)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -243,19 +232,25 @@ def main(args):
 
     start_time = last_logging = time.time()
     scaler = torch.cuda.amp.GradScaler()
-    global_step = start_epoch * len(loader)
+    global_step = start_epoch * steps_per_epoch
     save_every_epoch = (args.ckpt_interval == 0)
     ckpt_interval = args.ckpt_interval if not save_every_epoch else 1
 
     for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
+        # sampler.set_epoch(epoch) # No sampler with IterableDataset
         model.train()
 
-        for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
+        for step, ((x, y), _) in enumerate(loader):
+            # Manually break the loop after one epoch's worth of steps
+            if step >= steps_per_epoch:
+                break
+                
+            effective_step = global_step + step
+
             x = x.cuda(gpu, non_blocking=True)
             y = y.cuda(gpu, non_blocking=True)
 
-            lr = adjust_learning_rate(args, optimizer, loader, step)
+            lr = adjust_learning_rate(args, optimizer, steps_per_epoch, effective_step)
             
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
@@ -263,8 +258,6 @@ def main(args):
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
-            global_step += 1
 
             current_time = time.time()
             if args.rank == 0 and current_time - last_logging > args.log_freq_time:
@@ -279,10 +272,13 @@ def main(args):
                 
                 if use_wandb:
                     try:
-                        wandb.log({"batch_loss": stats["loss"], "lr": lr}, step=global_step)
+                        wandb.log({"batch_loss": stats["loss"], "lr": lr}, step=effective_step)
                     except Exception as e:
                         print(f"Warning: wandb.log failed: {e}", file=sys.stderr)
                 last_logging = current_time
+        
+        # Increment global step count at the end of each epoch
+        global_step += steps_per_epoch
 
         if args.rank == 0:
             should_save = save_every_epoch or ((epoch + 1) % ckpt_interval == 0)
@@ -297,11 +293,13 @@ def main(args):
     if args.rank == 0:
         torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
 
-# --- All functions and classes below this line are identical to the original script ---
+# --- All functions and classes below this line are identical to the original script,
+# --- except for the `adjust_learning_rate` function signature.
 
-def adjust_learning_rate(args, optimizer, loader, step):
-    max_steps = args.epochs * len(loader)
-    warmup_steps = 10 * len(loader)
+def adjust_learning_rate(args, optimizer, steps_per_epoch, step):
+    """Adjusts LR for a given step, using steps_per_epoch instead of len(loader)."""
+    max_steps = args.epochs * steps_per_epoch
+    warmup_steps = 10 * steps_per_epoch
     base_lr = args.base_lr * args.batch_size / 256
     if step < warmup_steps:
         lr = base_lr * step / warmup_steps
