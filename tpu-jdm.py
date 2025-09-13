@@ -56,7 +56,7 @@ class HuggingFaceImageNetDataset(IterableDataset):
     Custom PyTorch IterableDataset for streaming ImageNet from the Hugging Face Hub.
     This is memory-efficient as it doesn't download the whole dataset at once.
     """
-    def __init__(self, hf_dataset_name, split, transform=None, key):
+    def __init__(self, hf_dataset_name, split, key, transform=None):
         """
         Args:
             hf_dataset_name (string): Name of the dataset on Hugging Face Hub.
