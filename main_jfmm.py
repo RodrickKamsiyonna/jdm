@@ -86,8 +86,15 @@ def get_arguments():
 def main(args):
     torch.backends.cudnn.benchmark = True
     init_distributed_mode(args)
-    print(args)
-    gpu = torch.device(args.device)
+
+    # Ensure correct GPU mapping
+    if args.local_rank != -1:
+        torch.cuda.set_device(args.local_rank)
+        gpu = torch.device("cuda", args.local_rank)
+    else:
+        gpu = torch.device(args.device)
+
+    print(f"[rank {args.rank}] using device {gpu}")
 
     if args.rank == 0:
         args.exp_dir.mkdir(parents=True, exist_ok=True)
