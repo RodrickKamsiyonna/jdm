@@ -231,7 +231,6 @@ def main(args):
     save_every_epoch = (args.ckpt_interval == 0)
 
     for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
         model.train()
 
         epoch_loss_sum = 0.0
