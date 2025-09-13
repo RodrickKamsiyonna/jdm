@@ -71,11 +71,11 @@ class HuggingFaceImageNetDataset(IterableDataset):
                 token=True
             )
             if dist.is_available() and dist.is_initialized():
-                dist.barrier(device_ids=[self.local_rank])  # ✅ Avoid hangs
+                dist.barrier()  # ✅ Simplified barrier
         else:
             print(f"[Rank {self.rank}] Waiting for dataset initialization by rank 0...")
             if dist.is_available() and dist.is_initialized():
-                dist.barrier(device_ids=[self.local_rank])  # ✅ Avoid hangs
+                dist.barrier()  # ✅ Simplified barrier
 
         # --- Load dataset (streaming mode) ---
         self.dataset = datasets.load_dataset(
@@ -152,8 +152,13 @@ def get_arguments():
 def main(args):
     torch.backends.cudnn.benchmark = True
     init_distributed_mode(args)
+    
+    # ✅ Get local rank from env and set CUDA device early
+    local_rank = int(os.environ.get("LOCAL_RANK", getattr(args, "local_rank", 0)))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    
     print(args)
-    gpu = torch.device(args.device)
 
     if args.rank == 0:
         args.exp_dir.mkdir(parents=True, exist_ok=True)
@@ -203,10 +208,15 @@ def main(args):
     if args.rank == 0:
         print(f"Using an estimated {steps_per_epoch} steps per epoch.")
 
-    model = FlowMatching(args).cuda(gpu)
+    # ✅ Create model on device and use integer device_ids for DDP
+    model = FlowMatching(args).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = torch.nn.parallel.DistributedDataParallel(
-        model, device_ids=[gpu], find_unused_parameters=False, gradient_as_bucket_view=True
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=False,
+        gradient_as_bucket_view=True
     )
 
     optimizer = LARS(
@@ -246,8 +256,9 @@ def main(args):
             global_step = epoch * steps_per_epoch + step
             # --- End of Fix ---
 
-            x = x.cuda(gpu, non_blocking=True)
-            y = y.cuda(gpu, non_blocking=True)
+            # ✅ Use .to(device) instead of .cuda(gpu)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
             # --- FIX: Pass steps_per_epoch instead of loader ---
             lr = adjust_learning_rate(args, optimizer, steps_per_epoch, global_step)
