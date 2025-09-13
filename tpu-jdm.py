@@ -199,8 +199,6 @@ def main(args):
     steps_per_epoch = math.ceil(imagenet_train_size / args.batch_size)
     if args.rank == 0:
         print(f"Using an estimated {steps_per_epoch} steps per epoch.")
-    
-    # --- End of Data Loading Modification ---
 
     model = FlowMatching(args).cuda(gpu)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -209,14 +207,16 @@ def main(args):
     )
 
     optimizer = LARS(
-        model.parameters(), lr=0, weight_decay=args.wd,
+        model.parameters(),
+        lr=0,
+        weight_decay=args.wd,
         weight_decay_filter=exclude_bias_and_norm,
         lars_adaptation_filter=exclude_bias_and_norm,
     )
 
     if (args.exp_dir / "model.pth").is_file():
         if args.rank == 0:
-            print("Resuming from checkpoint")
+            print("resuming from checkpoint")
         ckpt = torch.load(args.exp_dir / "model.pth", map_location="cpu")
         start_epoch = ckpt.get("epoch", 0)
         model.load_state_dict(ckpt["model"])
@@ -225,44 +225,115 @@ def main(args):
         start_epoch = 0
 
     start_time = last_logging = time.time()
-    scaler = torch.cuda.amp.GradScaler()
-    global_step = start_epoch * steps_per_epoch
+    scaler = torch.amp.GradScaler(device="cuda")
+    global_step = start_epoch * len(loader)
+    ckpt_interval = max(1, args.ckpt_interval) if args.ckpt_interval != 0 else 1  # default to 1 if 0 given -> but we'll respect 0 meaning every epoch
     save_every_epoch = (args.ckpt_interval == 0)
-    ckpt_interval = args.ckpt_interval if not save_every_epoch else 1
 
     for epoch in range(start_epoch, args.epochs):
+        sampler.set_epoch(epoch)
         model.train()
-        for step, ((x, y), _) in enumerate(loader):
-            if step >= steps_per_epoch:
-                break
-            effective_step = global_step + step
+
+        epoch_loss_sum = 0.0
+        epoch_steps = 0
+
+        for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
             x = x.cuda(gpu, non_blocking=True)
             y = y.cuda(gpu, non_blocking=True)
-            lr = adjust_learning_rate(args, optimizer, steps_per_epoch, effective_step)
+
+            lr = adjust_learning_rate(args, optimizer, loader, step)
+            
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type="cuda"):
                 loss = model(x, y)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            current_time = time.time()
-            if args.rank == 0 and current_time - last_logging > args.log_freq_time:
-                stats = dict(epoch=epoch, step=step, loss=loss.item(), time=int(current_time - start_time), lr=lr)
-                print(json.dumps(stats), file=stats_file if stats_file else sys.stdout)
+
+            batch_loss = loss.item()
+            epoch_loss_sum += batch_loss
+            epoch_steps += 1
+            global_step += 1
+
+            batch_stats = dict(
+                epoch=epoch,
+                step=step,
+                global_step=global_step,
+                batch_loss=batch_loss,
+                time=int(time.time() - start_time),
+                lr=lr,
+            )
+
+            if args.rank == 0:
+                print(json.dumps(batch_stats))
+                if stats_file is not None:
+                    print(json.dumps(batch_stats), file=stats_file)
+
                 if use_wandb:
                     try:
-                        wandb.log({"batch_loss": stats["loss"], "lr": lr}, step=effective_step)
+                        wandb.log({"batch_loss": batch_loss, "lr": lr, "epoch": epoch, "step": step}, step=global_step)
                     except Exception as e:
                         print(f"Warning: wandb.log failed: {e}", file=sys.stderr)
+
+            current_time = time.time()
+            if args.rank == 0 and current_time - last_logging > args.log_freq_time:
+                stats = dict(
+                    epoch=epoch,
+                    step=step,
+                    loss=batch_loss,
+                    time=int(current_time - start_time),
+                    lr=lr,
+                )
+                print(json.dumps(stats))
+                if stats_file is not None:
+                    print(json.dumps(stats), file=stats_file)
                 last_logging = current_time
-        global_step += steps_per_epoch
+
+        avg_epoch_loss = epoch_loss_sum / max(1, epoch_steps)
+
         if args.rank == 0:
+            epoch_stats = dict(
+                epoch=epoch,
+                epoch_loss=avg_epoch_loss,
+                steps=epoch_steps,
+                time=int(time.time() - start_time),
+            )
+            print("EPOCH_SUMMARY: " + json.dumps(epoch_stats))
+            if stats_file is not None:
+                print("EPOCH_SUMMARY: " + json.dumps(epoch_stats), file=stats_file)
+
+            if use_wandb:
+                try:
+                    wandb.log({"epoch_loss": avg_epoch_loss, "epoch": epoch}, step=global_step)
+                except Exception as e:
+                    print(f"Warning: wandb.log failed at epoch end: {e}", file=sys.stderr)
+
             should_save = save_every_epoch or ((epoch + 1) % ckpt_interval == 0)
             if should_save:
-                state = dict(epoch=epoch + 1, model=model.state_dict(), optimizer=optimizer.state_dict())
-                torch.save(state, args.exp_dir / "model.pth")
+                state = dict(
+                    epoch=epoch + 1,
+                    model=model.state_dict(),
+                    optimizer=optimizer.state_dict(),
+                )
+                ckpt_path = args.exp_dir / "model.pth"
+                torch.save(state, ckpt_path)
+
     if args.rank == 0:
+        final_ckpt_path = args.exp_dir / "model_final.pth"
+        final_state = dict(
+            epoch=args.epochs,
+            model=model.state_dict(),
+            optimizer=optimizer.state_dict(),
+        )
+        torch.save(final_state, final_ckpt_path)
+
         torch.save(model.module.backbone.state_dict(), args.exp_dir / "resnet50.pth")
+
+        if use_wandb:
+            try:
+                wandb.save(str(final_ckpt_path))
+            except Exception:
+                pass
 
 def adjust_learning_rate(args, optimizer, steps_per_epoch, step):
     max_steps = args.epochs * steps_per_epoch
