@@ -63,65 +63,66 @@ class HuggingFaceImageNetDataset(IterableDataset):
             transform (callable, optional): Optional transform to be applied on a sample.
             is_main_process (bool): Flag to indicate if this is the main process (rank 0).
             dataset_size (int, optional): Known size of the dataset for calculating steps/epoch.
-                                          If None, a default ImageNet size is used.
         """
         self.transform = transform
         self.hf_dataset_name = hf_dataset_name
         self.split = split
-        # Store the dataset size for calculating steps per epoch
-        self.dataset_size = dataset_size if dataset_size is not None else 1281167 # Default ImageNet size
+        self.dataset_size = dataset_size if dataset_size is not None else 1281167  # Default ImageNet size
 
-        # --- DISTRIBUTED TRAINING FIX ---
-        # Let only the main process handle the initial dataset setup. This prevents
-        # a race condition where multiple processes try to download/prepare metadata
-        # simultaneously, which can cause failures on non-main processes.
-        if is_main_process:
-            print(f"Main process (rank 0) is initializing dataset '{self.hf_dataset_name}'...")
+        # --- Distributed setup and GPU assignment ---
+        if dist.is_available() and dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.world_size = dist.get_world_size()
+            torch.cuda.set_device(self.local_rank)
+        else:
+            self.rank = 0
+            self.local_rank = 0
+            self.world_size = 1
+
+        # --- Main process initializes dataset to avoid race conditions ---
+        if self.rank == 0:
+            print(f"[Rank 0] Initializing Hugging Face dataset: {self.hf_dataset_name} ({self.split})")
             datasets.load_dataset(
                 self.hf_dataset_name,
                 split=self.split,
                 streaming=True,
                 token=True
             )
-            # Add barrier after main process finishes initial setup
             if dist.is_available() and dist.is_initialized():
-                dist.barrier()
+                dist.barrier(device_ids=[self.local_rank])  # ✅ Avoid hangs
         else:
-            # Non-main processes wait for the main process to finish setup
+            print(f"[Rank {self.rank}] Waiting for dataset initialization by rank 0...")
             if dist.is_available() and dist.is_initialized():
-                dist.barrier()
-            print(f"Process (rank {dist.get_rank()}) waiting for dataset initialization...")
+                dist.barrier(device_ids=[self.local_rank])  # ✅ Avoid hangs
 
+        # --- Load dataset (streaming mode) ---
         self.dataset = datasets.load_dataset(
             self.hf_dataset_name,
             split=self.split,
             streaming=True,
-            token=True,
+            token=True
         )
-        # --- END OF FIX ---
 
     def __iter__(self):
-        # The 'datasets' library automatically handles sharding for multiple workers.
+        # Hugging Face streaming handles sharding across processes
         for sample in self.dataset:
-            # Based on the dataset structure for 'timm/imagenet-1k-wds':
-            # image data is in 'jpg', label is in 'cls'.
-            image = sample['jpg']  # This is already a PIL Image
-            label = sample['cls']
-            
-            # Ensure it's a PIL Image
+            image = sample.get("jpg", None)
+            label = sample.get("cls", None)
+
             if not isinstance(image, Image.Image):
-                print(f"Warning: Rank {dist.get_rank() if dist.is_available() and dist.is_initialized() else 'N/A'} unexpected image type {type(image)}, skipping.", file=sys.stderr)
+                print(f"[Rank {self.rank}] Warning: Unexpected image type {type(image)} — skipping.", file=sys.stderr)
                 continue
-    
+
             if self.transform:
                 img1, img2 = self.transform(image)
                 yield (img1, img2), label
             else:
                 yield image, label
 
-    # Optional: Provide a way to get the estimated size if needed elsewhere
     def get_dataset_size(self):
         return self.dataset_size
+
 
 # --- End of Custom Dataset ---
 
