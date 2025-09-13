@@ -74,6 +74,7 @@ class HuggingFaceImageNetDataset(IterableDataset):
                 self.hf_dataset_name,
                 split=self.split,
                 streaming=True,
+                token=True
             )
 
         # Synchronize all processes. The other processes will wait here until
@@ -87,7 +88,7 @@ class HuggingFaceImageNetDataset(IterableDataset):
             self.hf_dataset_name,
             split=self.split,
             streaming=True,
-            use_auth_token=True,
+            token=True,
         )
         print(f"Rank {dist.get_rank()} stream initialized successfully.")
         # --- END OF FIX ---
