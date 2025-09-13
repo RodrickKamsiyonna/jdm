@@ -79,8 +79,7 @@ class HuggingFaceImageNetDataset(IterableDataset):
 
         # Barrier to sync processes *after* dataset object is created and after device is set
         if dist.is_available() and dist.is_initialized():
-            # plain dist.barrier() works because we set device before init_process_group
-            dist.barrier()
+            dist.barrier(device_ids=[torch.cuda.current_device()])
 
     def __iter__(self):
         for sample in self.dataset:
