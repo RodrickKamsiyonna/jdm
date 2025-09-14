@@ -1,10 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-
 # All rights reserved.
-
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
 
 from pathlib import Path
 import argparse
@@ -19,14 +16,69 @@ import urllib
 from torch import nn, optim
 from torchvision import datasets, transforms
 import torch
+import numpy as np # --- NEW ---
+from torch.utils.data import TensorDataset # --- NEW ---
+
 
 import resnet
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        device = t.device
+        half_dim = self.dim // 2
+        emb_scale = np.log(10000) / (half_dim - 1)
+        freqs = torch.exp(torch.arange(half_dim, device=device) * -emb_scale)
+        embeddings = t.squeeze(-1)[:, None] * freqs[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
+def build_mlp(spec, last_layer_bias=False):
+    layers = []
+    f = list(map(int, spec.split("-")))
+    for i in range(len(f) - 2):
+        layers.append(nn.Linear(f[i], f[i + 1]))
+        layers.append(nn.BatchNorm1d(f[i + 1]))
+        layers.append(nn.ReLU(True))
+    layers.append(nn.Linear(f[-2], f[-1], bias=last_layer_bias))
+    return nn.Sequential(*layers)
+
+class FlowMatching(nn.Module):
+    def __init__(self, args, arch='resnet50', projector_mlp= '2048-4096-2048', time_emb_dim= '1024', time_emb_mlp='1024-2048-1024' , velocity_mlp = '5120-10240-2048'):
+        super().__init__()
+        self.backbone, self.embedding = resnet.__dict__[arch](
+            zero_init_residual=True
+        )
+        self.projection_head = build_mlp(projector_mlp)
+        self.time_embedding = SinusoidalTimeEmbedding(dim=time_emb_dim)
+        self.time_projection = build_mlp(time_emb_mlp)
+        self.velocity_predictor = build_mlp(velocity_mlp)
+
+    def forward(self, x, y):
+        # This forward pass is for training, we only need the components for sampling
+        raise NotImplementedError("This model is intended for sampling in this script.")
+# --- END NEW ---
 
 
 def get_arguments():
     parser = argparse.ArgumentParser(
         description="Evaluate a pretrained model on ImageNet"
     )
+    
+    parser.add_argument("--evaluation-mode", type=str, default="linear_probe", 
+                        choices=['linear_probe', 'single_shot_flow'],
+                        help="Choose the evaluation method.")
+    parser.add_argument("--flow-model-path", type=Path, 
+                        help="Path to the pretrained flow matching model (required for single_shot_flow mode)")
+    parser.add_argument("--num-flow-samples", type=int, default=50,
+                        help="Number of synthetic samples to generate per class for the linear head training.")
+    parser.add_argument("--sampling-steps", type=int, default=100,
+                        help="Number of integration steps for flow matching sampling.")
+    # --- END NEW ---
 
     # Data
     parser.add_argument("--data-dir", type=Path, help="path to dataset")
@@ -35,11 +87,11 @@ def get_arguments():
         default=100,
         type=int,
         choices=(100, 10, 1),
-        help="size of traing set in percent",
+        help="size of traing set in percent (only for 'linear_probe' mode)",
     )
 
     # Checkpoint
-    parser.add_argument("--pretrained", type=Path, help="path to pretrained model")
+    parser.add_argument("--pretrained", type=Path, required=True, help="path to pretrained backbone model")
     parser.add_argument(
         "--exp-dir",
         default="./checkpoint/lincls/",
@@ -105,6 +157,10 @@ def get_arguments():
 def main():
     parser = get_arguments()
     args = parser.parse_args()
+    
+    if args.evaluation_mode == 'single_shot_flow' and not args.flow_model_path:
+        raise ValueError("--flow-model-path is required for 'single_shot_flow' evaluation mode.")
+
     if args.train_percent in {1, 10}:
         args.train_files = urllib.request.urlopen(
             f"https://raw.githubusercontent.com/google-research/simclr/master/imagenet_subsets/{args.train_percent}percent.txt"
@@ -138,17 +194,18 @@ def main_worker(gpu, args):
     torch.cuda.set_device(gpu)
     torch.backends.cudnn.benchmark = True
 
-    backbone, embedding = resnet.__dict__[args.arch](zero_init_residual=True)
+    backbone, embedding_dim = resnet.__dict__[args.arch](zero_init_residual=True)
     state_dict = torch.load(args.pretrained, map_location="cpu")
     if "model" in state_dict:
         state_dict = state_dict["model"]
+    if "backbone" in list(state_dict.keys())[0]:
         state_dict = {
             key.replace("module.backbone.", ""): value
             for (key, value) in state_dict.items()
         }
-    backbone.load_state_dict(state_dict, strict=False)
+    backbone.load_state_dict(state_dict, strict=True) # Use strict=True for backbone
 
-    head = nn.Linear(embedding, 1000)
+    head = nn.Linear(embedding_dim, 1000)
     head.weight.data.normal_(mean=0.0, std=0.01)
     head.bias.data.zero_()
     model = nn.Sequential(backbone, head)
@@ -179,24 +236,12 @@ def main_worker(gpu, args):
         start_epoch = 0
         best_acc = argparse.Namespace(top1=0, top5=0)
 
-    # Data loading code
     traindir = args.data_dir / "train"
     valdir = args.data_dir / "val"
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
-
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose(
-            [
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]
-        ),
-    )
+    
     val_dataset = datasets.ImageFolder(
         valdir,
         transforms.Compose(
@@ -208,62 +253,173 @@ def main_worker(gpu, args):
             ]
         ),
     )
-
-    if args.train_percent in {1, 10}:
-        train_dataset.samples = []
-        for fname in args.train_files:
-            fname = fname.decode().strip()
-            cls = fname.split("_")[0]
-            train_dataset.samples.append(
-                (traindir / cls / fname, train_dataset.class_to_idx[cls])
-            )
-
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    
     kwargs = dict(
         batch_size=args.batch_size // args.world_size,
         num_workers=args.workers,
         pin_memory=True,
     )
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, sampler=train_sampler, **kwargs
-    )
     val_loader = torch.utils.data.DataLoader(val_dataset, **kwargs)
+
+    # --- MODIFIED: Logic to switch between evaluation modes ---
+    if args.evaluation_mode == 'linear_probe':
+        train_dataset = datasets.ImageFolder(
+            traindir,
+            transforms.Compose(
+                [
+                    transforms.RandomResizedCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    normalize,
+                ]
+            ),
+        )
+        if args.train_percent in {1, 10}:
+            train_dataset.samples = []
+            for fname in args.train_files:
+                fname = fname.decode().strip()
+                cls = fname.split("_")[0]
+                train_dataset.samples.append(
+                    (traindir / cls / fname, train_dataset.class_to_idx[cls])
+                )
+
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, sampler=train_sampler, **kwargs
+        )
+    
+    elif args.evaluation_mode == 'single_shot_flow':
+        if args.rank == 0:
+            print("--- Running Single-Shot Flow Evaluation ---")
+            
+            # 1. Load the Flow Matching model
+            # Assuming the FlowMatching model was trained with the same resnet arch
+            flow_model = FlowMatching(args, arch=args.arch)
+            flow_model_ckpt = torch.load(args.flow_model_path, map_location='cpu')['model']
+            flow_model.load_state_dict(flow_model_ckpt)
+            flow_model.cuda(gpu)
+            flow_model.eval()
+            print(f"Flow Matching model loaded from {args.flow_model_path}")
+
+            # 2. Get one image per class from the validation set
+            single_shot_data = {}
+            for img, label in val_dataset:
+                if label not in single_shot_data:
+                    single_shot_data[label] = img.unsqueeze(0).cuda(gpu)
+                if len(single_shot_data) == 1000:
+                    break
+            
+            print(f"Collected {len(single_shot_data)} single-shot images for context.")
+
+            # 3. Generate synthetic training data
+            generated_features = []
+            generated_labels = []
+            
+            backbone.eval()
+            with torch.no_grad():
+                for label, img_tensor in single_shot_data.items():
+                    print(f"Generating {args.num_flow_samples} samples for class {label}...")
+                    
+                    # Get context vector from the single image
+                    context_feature = backbone(img_tensor)
+                    projected_context = flow_model.projection_head(context_feature)
+                    
+                    # Generate samples
+                    synthetic_samples = sample_with_flow_matching(
+                        flow_model,
+                        projected_context,
+                        num_samples=args.num_flow_samples,
+                        num_steps=args.sampling_steps,
+                        device=gpu
+                    )
+                    
+                    # Add original context vector and synthetic samples to our new training set
+                    generated_features.append(context_feature.cpu())
+                    generated_features.append(synthetic_samples.cpu())
+                    
+                    labels_tensor = torch.full((args.num_flow_samples + 1,), label, dtype=torch.long)
+                    generated_labels.append(labels_tensor)
+
+            all_features = torch.cat(generated_features, dim=0)
+            all_labels = torch.cat(generated_labels, dim=0)
+            
+            print(f"Generated a synthetic training set with {all_features.shape[0]} samples.")
+
+            # 4. Create a new DataLoader for the synthetic features
+            synthetic_dataset = TensorDataset(all_features, all_labels)
+            # We train on rank 0 and broadcast the trained head, so no sampler needed here.
+            # Batch size can be larger as we are not loading images
+            train_loader = torch.utils.data.DataLoader(
+                synthetic_dataset, 
+                batch_size=min(1024, all_features.shape[0]), 
+                shuffle=True
+            )
+        
+        # Synchronize all processes to wait for rank 0 to finish generation
+        torch.distributed.barrier()
 
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
-        # train
-        if args.weights == "finetune":
-            model.train()
-        elif args.weights == "freeze":
-            model.eval()
-        else:
-            assert False
-        train_sampler.set_epoch(epoch)
-        for step, (images, target) in enumerate(
-            train_loader, start=epoch * len(train_loader)
-        ):
-            output = model(images.cuda(gpu, non_blocking=True))
-            loss = criterion(output, target.cuda(gpu, non_blocking=True))
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            if step % args.print_freq == 0:
-                torch.distributed.reduce(loss.div_(args.world_size), 0)
-                if args.rank == 0:
-                    pg = optimizer.param_groups
-                    lr_head = pg[0]["lr"]
-                    lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
-                    stats = dict(
-                        epoch=epoch,
-                        step=step,
-                        lr_backbone=lr_backbone,
-                        lr_head=lr_head,
-                        loss=loss.item(),
-                        time=int(time.time() - start_time),
-                    )
-                    print(json.dumps(stats))
-                    print(json.dumps(stats), file=stats_file)
+        
+        # --- MODIFIED: Handle training logic based on mode ---
+        if args.evaluation_mode == 'linear_probe':
+            train_sampler.set_epoch(epoch)
+            # The original training loop for linear probe on images
+            if args.weights == "finetune":
+                model.train()
+            elif args.weights == "freeze":
+                model.eval() # Backbone is frozen, only head is trained
+            
+            for step, (images, target) in enumerate(
+                train_loader, start=epoch * len(train_loader)
+            ):
+                output = model(images.cuda(gpu, non_blocking=True))
+                loss = criterion(output, target.cuda(gpu, non_blocking=True))
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                if step % args.print_freq == 0:
+                    torch.distributed.reduce(loss.div_(args.world_size), 0)
+                    if args.rank == 0:
+                        pg = optimizer.param_groups
+                        lr_head = pg[0]["lr"]
+                        lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
+                        stats = dict(
+                            epoch=epoch, step=step, lr_backbone=lr_backbone,
+                            lr_head=lr_head, loss=loss.item(),
+                            time=int(time.time() - start_time),
+                        )
+                        print(json.dumps(stats))
+                        print(json.dumps(stats), file=stats_file)
+        
+        elif args.evaluation_mode == 'single_shot_flow':
+             # New training loop for training the head on generated features
+            if args.rank == 0:
+                head.train() # Only train the head
+                for step, (features, target) in enumerate(train_loader):
+                    features = features.cuda(gpu, non_blocking=True)
+                    target = target.cuda(gpu, non_blocking=True)
+                    
+                    output = head(features) # Pass features directly to the head
+                    loss = criterion(output, target)
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
+                    if step % args.print_freq == 0:
+                        stats = dict(
+                            epoch=epoch, step=step, lr_head=optimizer.param_groups[0]["lr"],
+                            loss=loss.item(), time=int(time.time() - start_time),
+                        )
+                        print(json.dumps(stats))
+                        print(json.dumps(stats), file=stats_file)
+            
+            # Broadcast the trained head from rank 0 to all other processes
+            torch.distributed.barrier()
+            for param in head.parameters():
+                torch.distributed.broadcast(param.data, 0)
+        
         # evaluate
         model.eval()
         if args.rank == 0:
@@ -280,11 +436,8 @@ def main_worker(gpu, args):
             best_acc.top1 = max(best_acc.top1, top1.avg)
             best_acc.top5 = max(best_acc.top5, top5.avg)
             stats = dict(
-                epoch=epoch,
-                acc1=top1.avg,
-                acc5=top5.avg,
-                best_acc1=best_acc.top1,
-                best_acc5=best_acc.top5,
+                epoch=epoch, acc1=top1.avg, acc5=top5.avg,
+                best_acc1=best_acc.top1, best_acc5=best_acc.top5,
             )
             print(json.dumps(stats))
             print(json.dumps(stats), file=stats_file)
@@ -301,18 +454,43 @@ def main_worker(gpu, args):
             torch.save(state, args.exp_dir / "checkpoint.pth")
 
 
+# --- NEW: Sampling function ---
+@torch.no_grad()
+def sample_with_flow_matching(flow_model, context_vector, num_samples, num_steps, device):
+    """
+    Generates samples using the flow matching model via Euler integration.
+    """
+    # Repeat context for batch generation
+    context = context_vector.repeat(num_samples, 1)
+    
+    # Start with random noise from a standard normal distribution
+    y_t = torch.randn(num_samples, flow_model.embedding, device=device)
+    
+    dt = 1.0 / num_steps
+    for i in range(num_steps):
+        t = torch.full((num_samples, 1), i * dt, device=device)
+        
+        # Predict velocity
+        t_emb = flow_model.time_embedding(t)
+        t_emb_proj = flow_model.time_projection(t_emb)
+        
+        velocity = flow_model.velocity_predictor(torch.cat([y_t, context, t_emb_proj], dim=1))
+        
+        # Update sample using Euler step
+        y_t = y_t + velocity * dt
+        
+    return y_t
+# --- END NEW ---
+
 def handle_sigusr1(signum, frame):
     os.system(f'scontrol requeue {os.getenv("SLURM_JOB_ID")}')
     exit()
 
-
 def handle_sigterm(signum, frame):
     pass
 
-
 class AverageMeter(object):
     """Computes and stores the average and current value"""
-
     def __init__(self, name, fmt=":f"):
         self.name = name
         self.fmt = fmt
@@ -334,7 +512,6 @@ class AverageMeter(object):
         fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)
 
-
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
@@ -350,7 +527,6 @@ def accuracy(output, target, topk=(1,)):
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
-
 
 if __name__ == "__main__":
     main()
