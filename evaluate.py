@@ -16,8 +16,8 @@ import urllib
 from torch import nn, optim
 from torchvision import datasets, transforms
 import torch
-import numpy as np # --- NEW ---
-from torch.utils.data import TensorDataset # --- NEW ---
+import numpy as np
+from torch.utils.data import TensorDataset
 
 
 import resnet
@@ -61,8 +61,6 @@ class FlowMatching(nn.Module):
     def forward(self, x, y):
         # This forward pass is for training, we only need the components for sampling
         raise NotImplementedError("This model is intended for sampling in this script.")
-# --- END NEW ---
-
 
 def get_arguments():
     parser = argparse.ArgumentParser(
@@ -78,7 +76,6 @@ def get_arguments():
                         help="Number of synthetic samples to generate per class for the linear head training.")
     parser.add_argument("--sampling-steps", type=int, default=100,
                         help="Number of integration steps for flow matching sampling.")
-    # --- END NEW ---
 
     # Data
     parser.add_argument("--data-dir", type=Path, help="path to dataset")
@@ -152,6 +149,29 @@ def get_arguments():
     )
 
     return parser
+
+
+def extract_features_and_stats(loader, backbone, device):
+    backbone.eval()
+    features_list = []
+    targets_list = []
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device, non_blocking=True)
+            features = backbone(images)
+            features_list.append(features.cpu())
+            targets_list.append(targets)
+    all_features = torch.cat(features_list, dim=0)
+    all_targets = torch.cat(targets_list, dim=0)
+
+    mean = all_features.mean(dim=0, keepdim=True)
+    std = all_features.std(dim=0, keepdim=True) + 1e-6  # Avoid division by zero
+
+    return all_features, all_targets, mean, std
+
+
+def standardize_features(features, mean, std):
+    return (features - mean) / std
 
 
 def main():
@@ -293,7 +313,6 @@ def main_worker(gpu, args):
             print("--- Running Single-Shot Flow Evaluation ---")
             
             # 1. Load the Flow Matching model
-            # Assuming the FlowMatching model was trained with the same resnet arch
             flow_model = FlowMatching(args, arch=args.arch)
             flow_model_ckpt = torch.load(args.flow_model_path, map_location='cpu')['model']
             flow_model.load_state_dict(flow_model_ckpt)
@@ -358,23 +377,53 @@ def main_worker(gpu, args):
         # Synchronize all processes to wait for rank 0 to finish generation
         torch.distributed.barrier()
 
+    # Precompute mean and std for standardization (only for linear_probe mode)
+    mean = None
+    std = None
+    if args.evaluation_mode == 'linear_probe' and args.weights == "freeze":
+        if args.rank == 0:
+            print("Extracting features and computing mean/std...")
+            features, targets, mean, std = extract_features_and_stats(train_loader, backbone, gpu)
+            mean = mean.cuda(gpu)
+            std = std.cuda(gpu)
+            # Replace train_loader with standardized features
+            standardized_features = standardize_features(features, mean, std)
+            standardized_dataset = TensorDataset(standardized_features, targets)
+            train_loader = torch.utils.data.DataLoader(
+                standardized_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.workers,
+                pin_memory=True
+            )
+        torch.distributed.barrier()
+        if args.rank != 0:
+            mean = torch.zeros(1, embedding_dim).cuda(gpu)
+            std = torch.ones(1, embedding_dim).cuda(gpu)
+        torch.distributed.broadcast(mean, 0)
+        torch.distributed.broadcast(std, 0)
+
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
         
         # --- MODIFIED: Handle training logic based on mode ---
         if args.evaluation_mode == 'linear_probe':
-            train_sampler.set_epoch(epoch)
-            # The original training loop for linear probe on images
             if args.weights == "finetune":
                 model.train()
             elif args.weights == "freeze":
                 model.eval() # Backbone is frozen, only head is trained
             
-            for step, (images, target) in enumerate(
+            for step, (features_or_images, target) in enumerate(
                 train_loader, start=epoch * len(train_loader)
             ):
-                output = model(images.cuda(gpu, non_blocking=True))
-                loss = criterion(output, target.cuda(gpu, non_blocking=True))
+                target = target.cuda(gpu, non_blocking=True)
+                if args.weights == "freeze":
+                    features = features_or_images.cuda(gpu, non_blocking=True)
+                    output = head(features)
+                else:
+                    images = features_or_images.cuda(gpu, non_blocking=True)
+                    output = model(images)
+                loss = criterion(output, target)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
