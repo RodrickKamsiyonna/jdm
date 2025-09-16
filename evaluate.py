@@ -387,7 +387,7 @@ def main_worker(gpu, args):
             mean = mean.cuda(gpu)
             std = std.cuda(gpu)
             # Replace train_loader with standardized features
-            standardized_features = standardize_features(features, mean, std)
+            standardized_features = standardize_features(features, mean.cpu(), std.cpu())
             standardized_dataset = TensorDataset(standardized_features, targets)
             train_loader = torch.utils.data.DataLoader(
                 standardized_dataset,
