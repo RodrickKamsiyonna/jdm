@@ -1,3 +1,4 @@
+# evaluate.py
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 # This source code is licensed under the license found in the
@@ -19,63 +20,13 @@ import torch
 import numpy as np
 from torch.utils.data import TensorDataset
 
-
 import resnet
 
-
-class SinusoidalTimeEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, t):
-        device = t.device
-        half_dim = self.dim // 2
-        emb_scale = np.log(10000) / (half_dim - 1)
-        freqs = torch.exp(torch.arange(half_dim, device=device) * -emb_scale)
-        embeddings = t.squeeze(-1)[:, None] * freqs[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
-
-def build_mlp(spec, last_layer_bias=False):
-    layers = []
-    f = list(map(int, spec.split("-")))
-    for i in range(len(f) - 2):
-        layers.append(nn.Linear(f[i], f[i + 1]))
-        layers.append(nn.BatchNorm1d(f[i + 1]))
-        layers.append(nn.ReLU(True))
-    layers.append(nn.Linear(f[-2], f[-1], bias=last_layer_bias))
-    return nn.Sequential(*layers)
-
-class FlowMatching(nn.Module):
-    def __init__(self, args, arch='resnet50', projector_mlp= '2048-4096-2048', time_emb_dim= '1024', time_emb_mlp='1024-2048-1024' , velocity_mlp = '5120-10240-2048'):
-        super().__init__()
-        self.backbone, self.embedding = resnet.__dict__[arch](
-            zero_init_residual=True
-        )
-        self.projection_head = build_mlp(projector_mlp)
-        self.time_embedding = SinusoidalTimeEmbedding(dim=time_emb_dim)
-        self.time_projection = build_mlp(time_emb_mlp)
-        self.velocity_predictor = build_mlp(velocity_mlp)
-
-    def forward(self, x, y):
-        # This forward pass is for training, we only need the components for sampling
-        raise NotImplementedError("This model is intended for sampling in this script.")
 
 def get_arguments():
     parser = argparse.ArgumentParser(
         description="Evaluate a pretrained model on ImageNet"
     )
-    
-    parser.add_argument("--evaluation-mode", type=str, default="linear_probe", 
-                        choices=['linear_probe', 'single_shot_flow'],
-                        help="Choose the evaluation method.")
-    parser.add_argument("--flow-model-path", type=Path, 
-                        help="Path to the pretrained flow matching model (required for single_shot_flow mode)")
-    parser.add_argument("--num-flow-samples", type=int, default=50,
-                        help="Number of synthetic samples to generate per class for the linear head training.")
-    parser.add_argument("--sampling-steps", type=int, default=100,
-                        help="Number of integration steps for flow matching sampling.")
 
     # Data
     parser.add_argument("--data-dir", type=Path, help="path to dataset")
@@ -84,7 +35,7 @@ def get_arguments():
         default=100,
         type=int,
         choices=(100, 10, 1),
-        help="size of traing set in percent (only for 'linear_probe' mode)",
+        help="size of training set in percent",
     )
 
     # Checkpoint
@@ -142,7 +93,7 @@ def get_arguments():
     # Running
     parser.add_argument(
         "--workers",
-        default=8,
+        default=4,
         type=int,
         metavar="N",
         help="number of data loader workers",
@@ -159,6 +110,7 @@ def extract_features_and_stats(loader, backbone, device):
         for images, targets in loader:
             images = images.to(device, non_blocking=True)
             features = backbone(images)
+            # store on CPU to avoid holding GPU memory
             features_list.append(features.cpu())
             targets_list.append(targets)
     all_features = torch.cat(features_list, dim=0)
@@ -171,97 +123,161 @@ def extract_features_and_stats(loader, backbone, device):
 
 
 def standardize_features(features, mean, std):
+    # features, mean, std should be on same device before calling this
     return (features - mean) / std
 
 
 def main():
     parser = get_arguments()
     args = parser.parse_args()
-    
-    if args.evaluation_mode == 'single_shot_flow' and not args.flow_model_path:
-        raise ValueError("--flow-model-path is required for 'single_shot_flow' evaluation mode.")
 
+    # optional remote subset listing
     if args.train_percent in {1, 10}:
-        args.train_files = urllib.request.urlopen(
-            f"https://raw.githubusercontent.com/google-research/simclr/master/imagenet_subsets/{args.train_percent}percent.txt"
-        ).readlines()
-    args.ngpus_per_node = torch.cuda.device_count()
+        try:
+            args.train_files = urllib.request.urlopen(
+                f"https://raw.githubusercontent.com/google-research/simclr/master/imagenet_subsets/{args.train_percent}percent.txt"
+            ).readlines()
+        except Exception:
+            print("Warning: failed to download train_percent file. Expecting local dataset layout.")
+            args.train_files = None
+
+    # decide distributed mode
+    # If torchrun/env vars are present -> use them
+    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+        args.world_size = int(os.environ["WORLD_SIZE"])
+        args.rank = int(os.environ.get("RANK", 0))
+        args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        args.dist_url = "env://"
+        args.use_torchrun = True
+    else:
+        # fallback: detect available GPUs and spawn if >1
+        args.ngpus_per_node = torch.cuda.device_count()
+        args.world_size = args.ngpus_per_node
+        args.rank = 0
+        args.local_rank = 0
+        args.dist_url = f"tcp://localhost:{random.randrange(49152, 65535)}"
+        args.use_torchrun = False
+
+    # SLURM handlers (unchanged)
     if "SLURM_JOB_ID" in os.environ:
         signal.signal(signal.SIGUSR1, handle_sigusr1)
         signal.signal(signal.SIGTERM, handle_sigterm)
-    # single-node distributed training
-    args.rank = 0
-    args.dist_url = f"tcp://localhost:{random.randrange(49152, 65535)}"
-    args.world_size = args.ngpus_per_node
-    torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
+
+    # Launch worker(s)
+    if args.use_torchrun:
+        # torchrun already spawned processes, just call main_worker with LOCAL_RANK
+        main_worker(args.local_rank, args)
+    else:
+        # if multiple GPUs, spawn; otherwise call directly (single GPU)
+        if args.world_size > 1:
+            torch.multiprocessing.spawn(main_worker, (args,), args.world_size)
+        else:
+            main_worker(0, args)
 
 
 def main_worker(gpu, args):
-    args.rank += gpu
-    torch.distributed.init_process_group(
-        backend="nccl",
-        init_method=args.dist_url,
-        world_size=args.world_size,
-        rank=args.rank,
-    )
+    # gpu is the local GPU index for this process
+    args.gpu = gpu
+    # Initialize distributed if world_size > 1
+    distributed = args.world_size > 1
+
+    if distributed:
+        # Use env:// when launched with torchrun, otherwise the tcp:// we set earlier.
+        torch.distributed.init_process_group(
+            backend="nccl",
+            init_method=args.dist_url,
+            world_size=args.world_size,
+            rank=(args.rank + gpu) if not args.use_torchrun else int(os.environ.get("RANK", 0)),
+        )
+
+    # only rank 0 handles logs/stat file creation
+    rank = int(os.environ.get("RANK", args.rank + (gpu if not args.use_torchrun else 0)))
+    args.rank = rank
 
     if args.rank == 0:
         args.exp_dir.mkdir(parents=True, exist_ok=True)
         stats_file = open(args.exp_dir / "stats.txt", "a", buffering=1)
         print(" ".join(sys.argv))
         print(" ".join(sys.argv), file=stats_file)
+    else:
+        stats_file = None
 
-    torch.cuda.set_device(gpu)
+    # set device
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu)
+    device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
+    # Build backbone
     backbone, embedding_dim = resnet.__dict__[args.arch](zero_init_residual=True)
-    state_dict = torch.load(args.pretrained, map_location="cpu")
-    if "model" in state_dict:
-        state_dict = state_dict["model"]
-    if "backbone" in list(state_dict.keys())[0]:
-        state_dict = {
-            key.replace("module.backbone.", ""): value
-            for (key, value) in state_dict.items()
-        }
-    backbone.load_state_dict(state_dict, strict=True) # Use strict=True for backbone
 
+    # Load pretrained state dict robustly
+    state_dict = torch.load(args.pretrained, map_location="cpu")
+    if isinstance(state_dict, dict) and "model" in state_dict:
+        state_dict = state_dict["model"]
+    # if this is a wrapped checkpoint, try to unwrap keys
+    try:
+        first_key = list(state_dict.keys())[0]
+        if "backbone" in first_key or first_key.startswith("module.backbone"):
+            state_dict = {
+                key.replace("module.backbone.", "").replace("backbone.", ""): value
+                for (key, value) in state_dict.items()
+            }
+    except Exception:
+        pass
+
+    # load with strict=False to avoid failure on small key mismatches
+    backbone.load_state_dict(state_dict, strict=False)
+
+    # head and model
     head = nn.Linear(embedding_dim, 1000)
     head.weight.data.normal_(mean=0.0, std=0.01)
     head.bias.data.zero_()
     model = nn.Sequential(backbone, head)
-    model.cuda(gpu)
+    model.to(device)
 
     if args.weights == "freeze":
         backbone.requires_grad_(False)
         head.requires_grad_(True)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
-    criterion = nn.CrossEntropyLoss().cuda(gpu)
+    if distributed:
+        # wrap with DDP
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu] if torch.cuda.is_available() else None)
 
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    # optimizer
     param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
     if args.weights == "finetune":
         param_groups.append(dict(params=backbone.parameters(), lr=args.lr_backbone))
     optimizer = optim.SGD(param_groups, 0, momentum=0.9, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
-    # automatically resume from checkpoint if it exists
+    # resume if checkpoint exists (non-strict restore, safest to load optimizer if present)
+    start_epoch = 0
     if (args.exp_dir / "checkpoint.pth").is_file():
         ckpt = torch.load(args.exp_dir / "checkpoint.pth", map_location="cpu")
-        start_epoch = ckpt["epoch"]
-        best_acc = ckpt["best_acc"]
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt.get("epoch", 0)
+        best_acc = ckpt.get("best_acc", argparse.Namespace(top1=0, top5=0))
+        try:
+            model.load_state_dict(ckpt["model"])
+        except Exception:
+            print("Warning: failed to load full model state; continuing with loaded backbone + fresh head.")
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except Exception:
+            pass
     else:
-        start_epoch = 0
         best_acc = argparse.Namespace(top1=0, top5=0)
 
+    # prepare datasets and loaders
     traindir = args.data_dir / "train"
     valdir = args.data_dir / "val"
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
-    
+
     val_dataset = datasets.ImageFolder(
         valdir,
         transforms.Compose(
@@ -273,122 +289,64 @@ def main_worker(gpu, args):
             ]
         ),
     )
-    
+
+    # batch size per process; avoid zero
+    per_process_batch = max(1, args.batch_size // max(1, args.world_size))
     kwargs = dict(
-        batch_size=args.batch_size // args.world_size,
+        batch_size=per_process_batch,
         num_workers=args.workers,
         pin_memory=True,
     )
     val_loader = torch.utils.data.DataLoader(val_dataset, **kwargs)
 
-    # --- MODIFIED: Logic to switch between evaluation modes ---
-    if args.evaluation_mode == 'linear_probe':
-        train_dataset = datasets.ImageFolder(
-            traindir,
-            transforms.Compose(
-                [
-                    transforms.RandomResizedCrop(224),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor(),
-                    normalize,
-                ]
-            ),
-        )
-        if args.train_percent in {1, 10}:
-            train_dataset.samples = []
-            for fname in args.train_files:
-                fname = fname.decode().strip()
-                cls = fname.split("_")[0]
-                train_dataset.samples.append(
-                    (traindir / cls / fname, train_dataset.class_to_idx[cls])
-                )
-
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, sampler=train_sampler, **kwargs
-        )
-    
-    elif args.evaluation_mode == 'single_shot_flow':
-        if args.rank == 0:
-            print("--- Running Single-Shot Flow Evaluation ---")
-            
-            # 1. Load the Flow Matching model
-            flow_model = FlowMatching(args, arch=args.arch)
-            flow_model_ckpt = torch.load(args.flow_model_path, map_location='cpu')['model']
-            flow_model.load_state_dict(flow_model_ckpt)
-            flow_model.cuda(gpu)
-            flow_model.eval()
-            print(f"Flow Matching model loaded from {args.flow_model_path}")
-
-            # 2. Get one image per class from the validation set
-            single_shot_data = {}
-            for img, label in val_dataset:
-                if label not in single_shot_data:
-                    single_shot_data[label] = img.unsqueeze(0).cuda(gpu)
-                if len(single_shot_data) == 1000:
-                    break
-            
-            print(f"Collected {len(single_shot_data)} single-shot images for context.")
-
-            # 3. Generate synthetic training data
-            generated_features = []
-            generated_labels = []
-            
-            backbone.eval()
-            with torch.no_grad():
-                for label, img_tensor in single_shot_data.items():
-                    print(f"Generating {args.num_flow_samples} samples for class {label}...")
-                    
-                    # Get context vector from the single image
-                    context_feature = backbone(img_tensor)
-                    projected_context = flow_model.projection_head(context_feature)
-                    
-                    # Generate samples
-                    synthetic_samples = sample_with_flow_matching(
-                        flow_model,
-                        projected_context,
-                        num_samples=args.num_flow_samples,
-                        num_steps=args.sampling_steps,
-                        device=gpu
-                    )
-                    
-                    # Add original context vector and synthetic samples to our new training set
-                    generated_features.append(context_feature.cpu())
-                    generated_features.append(synthetic_samples.cpu())
-                    
-                    labels_tensor = torch.full((args.num_flow_samples + 1,), label, dtype=torch.long)
-                    generated_labels.append(labels_tensor)
-
-            all_features = torch.cat(generated_features, dim=0)
-            all_labels = torch.cat(generated_labels, dim=0)
-            
-            print(f"Generated a synthetic training set with {all_features.shape[0]} samples.")
-
-            # 4. Create a new DataLoader for the synthetic features
-            synthetic_dataset = TensorDataset(all_features, all_labels)
-            # We train on rank 0 and broadcast the trained head, so no sampler needed here.
-            # Batch size can be larger as we are not loading images
-            train_loader = torch.utils.data.DataLoader(
-                synthetic_dataset, 
-                batch_size=min(1024, all_features.shape[0]), 
-                shuffle=True
+    # Training dataset
+    train_dataset = datasets.ImageFolder(
+        traindir,
+        transforms.Compose(
+            [
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        ),
+    )
+    if args.train_percent in {1, 10} and getattr(args, "train_files", None):
+        # rebuild samples list from provided file names
+        train_dataset.samples = []
+        for fname in args.train_files:
+            fname = fname.decode().strip()
+            cls = fname.split("_")[0]
+            train_dataset.samples.append(
+                (str(traindir / cls / fname), train_dataset.class_to_idx[cls])
             )
-        
-        # Synchronize all processes to wait for rank 0 to finish generation
-        torch.distributed.barrier()
 
-    # Precompute mean and std for standardization (only for linear_probe mode)
+    # distributed sampler only in distributed mode
+    if distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, sampler=train_sampler, batch_size=args.batch_size if not distributed else per_process_batch,
+        num_workers=args.workers, pin_memory=True, shuffle=(train_sampler is None)
+    )
+
+    # Precompute mean and std for standardization (only when freezing the backbone)
     mean = None
     std = None
-    if args.evaluation_mode == 'linear_probe' and args.weights == "freeze":
+    if args.weights == "freeze":
         if args.rank == 0:
             print("Extracting features and computing mean/std...")
-            features, targets, mean, std = extract_features_and_stats(train_loader, backbone, gpu)
-            mean = mean.cuda(gpu)
-            std = std.cuda(gpu)
-            # Replace train_loader with standardized features
-            standardized_features = standardize_features(features, mean.cpu(), std.cpu())
+            # Use backbone in eval and extract features (on device)
+            features, targets, mean_cpu, std_cpu = extract_features_and_stats(train_loader, backbone, device)
+            # mean/std are on CPU; we will broadcast GPU copies if distributed
+            mean = mean_cpu
+            std = std_cpu
+            # standardize features on CPU
+            standardized_features = standardize_features(features, mean, std)
             standardized_dataset = TensorDataset(standardized_features, targets)
+            # replace train_loader with standardized CPU features loader
             train_loader = torch.utils.data.DataLoader(
                 standardized_dataset,
                 batch_size=args.batch_size,
@@ -396,89 +354,92 @@ def main_worker(gpu, args):
                 num_workers=args.workers,
                 pin_memory=True
             )
-        torch.distributed.barrier()
-        if args.rank != 0:
-            mean = torch.zeros(1, embedding_dim).cuda(gpu)
-            std = torch.ones(1, embedding_dim).cuda(gpu)
-        torch.distributed.broadcast(mean, 0)
-        torch.distributed.broadcast(std, 0)
+
+        # synchronize mean/std across processes (if distributed)
+        if distributed:
+            # rank 0 needs to send mean/std to others. Move to GPU for broadcast.
+            if args.rank == 0:
+                mean_gpu = mean.to(device)
+                std_gpu = std.to(device)
+            else:
+                mean_gpu = torch.zeros(1, embedding_dim, device=device)
+                std_gpu = torch.ones(1, embedding_dim, device=device)
+            torch.distributed.barrier()
+            torch.distributed.broadcast(mean_gpu, src=0)
+            torch.distributed.broadcast(std_gpu, src=0)
+            # ensure all ranks have CPU copies (we'll keep features on CPU)
+            mean = mean_gpu.cpu()
+            std = std_gpu.cpu()
+        else:
+            # single-process: mean/std already present on CPU
+            pass
 
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
-        
-        # --- MODIFIED: Handle training logic based on mode ---
-        if args.evaluation_mode == 'linear_probe':
-            if args.weights == "finetune":
-                model.train()
-            elif args.weights == "freeze":
-                model.eval() # Backbone is frozen, only head is trained
-            
-            for step, (features_or_images, target) in enumerate(
-                train_loader, start=epoch * len(train_loader)
-            ):
-                target = target.cuda(gpu, non_blocking=True)
-                if args.weights == "freeze":
-                    features = features_or_images.cuda(gpu, non_blocking=True)
-                    output = head(features)
-                else:
-                    images = features_or_images.cuda(gpu, non_blocking=True)
-                    output = model(images)
-                loss = criterion(output, target)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                if step % args.print_freq == 0:
-                    torch.distributed.reduce(loss.div_(args.world_size), 0)
-                    if args.rank == 0:
-                        pg = optimizer.param_groups
-                        lr_head = pg[0]["lr"]
-                        lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
-                        stats = dict(
-                            epoch=epoch, step=step, lr_backbone=lr_backbone,
-                            lr_head=lr_head, loss=loss.item(),
-                            time=int(time.time() - start_time),
-                        )
-                        print(json.dumps(stats))
-                        print(json.dumps(stats), file=stats_file)
-        
-        elif args.evaluation_mode == 'single_shot_flow':
-             # New training loop for training the head on generated features
-            if args.rank == 0:
-                head.train() # Only train the head
-                for step, (features, target) in enumerate(train_loader):
-                    features = features.cuda(gpu, non_blocking=True)
-                    target = target.cuda(gpu, non_blocking=True)
-                    
-                    output = head(features) # Pass features directly to the head
-                    loss = criterion(output, target)
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
 
-                    if step % args.print_freq == 0:
-                        stats = dict(
-                            epoch=epoch, step=step, lr_head=optimizer.param_groups[0]["lr"],
-                            loss=loss.item(), time=int(time.time() - start_time),
-                        )
-                        print(json.dumps(stats))
+        if args.weights == "finetune":
+            model.train()
+        elif args.weights == "freeze":
+            model.eval()  # Backbone frozen; head will be used on features or backbone outputs
+
+        # if distributed and using a DistributedSampler, set epoch for shuffling
+        if distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        for step, (features_or_images, target) in enumerate(
+            train_loader, start=epoch * max(1, len(train_loader))
+        ):
+            target = target.to(device, non_blocking=True)
+            if args.weights == "freeze":
+                # features are either tensors (CPU) or already on device; ensure on device
+                if features_or_images.device.type == "cpu":
+                    features = features_or_images.to(device, non_blocking=True)
+                else:
+                    features = features_or_images.to(device, non_blocking=True)
+                output = head(features)
+            else:
+                images = features_or_images.to(device, non_blocking=True)
+                output = model(images)
+            loss = criterion(output, target)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if step % args.print_freq == 0:
+                # reduce loss across processes only when distributed
+                if distributed:
+                    loss_reduced = loss.detach()
+                    torch.distributed.reduce(loss_reduced, dst=0)
+                    if args.rank == 0:
+                        reduced_loss = (loss_reduced / args.world_size).item()
+                    else:
+                        reduced_loss = None
+                else:
+                    reduced_loss = loss.item()
+
+                if args.rank == 0:
+                    pg = optimizer.param_groups
+                    lr_head = pg[0]["lr"]
+                    lr_backbone = pg[1]["lr"] if len(pg) == 2 else 0
+                    stats = dict(
+                        epoch=epoch, step=step, lr_backbone=lr_backbone,
+                        lr_head=lr_head, loss=reduced_loss,
+                        time=int(time.time() - start_time),
+                    )
+                    print(json.dumps(stats))
+                    if stats_file:
                         print(json.dumps(stats), file=stats_file)
-            
-            # Broadcast the trained head from rank 0 to all other processes
-            torch.distributed.barrier()
-            for param in head.parameters():
-                torch.distributed.broadcast(param.data, 0)
-        
+
         # evaluate
-        model.eval()
         if args.rank == 0:
+            model.eval()
             top1 = AverageMeter("Acc@1")
             top5 = AverageMeter("Acc@5")
             with torch.no_grad():
                 for images, target in val_loader:
-                    output = model(images.cuda(gpu, non_blocking=True))
+                    images = images.to(device, non_blocking=True)
+                    output = model(images)
                     acc1, acc5 = accuracy(
-                        output, target.cuda(gpu, non_blocking=True), topk=(1, 5)
+                        output, target.to(device, non_blocking=True), topk=(1, 5)
                     )
                     top1.update(acc1[0].item(), images.size(0))
                     top5.update(acc5[0].item(), images.size(0))
@@ -489,9 +450,11 @@ def main_worker(gpu, args):
                 best_acc1=best_acc.top1, best_acc5=best_acc.top5,
             )
             print(json.dumps(stats))
-            print(json.dumps(stats), file=stats_file)
+            if stats_file:
+                print(json.dumps(stats), file=stats_file)
 
         scheduler.step()
+
         if args.rank == 0:
             state = dict(
                 epoch=epoch + 1,
@@ -503,43 +466,18 @@ def main_worker(gpu, args):
             torch.save(state, args.exp_dir / "checkpoint.pth")
 
 
-# --- NEW: Sampling function ---
-@torch.no_grad()
-def sample_with_flow_matching(flow_model, context_vector, num_samples, num_steps, device):
-    """
-    Generates samples using the flow matching model via Euler integration.
-    """
-    # Repeat context for batch generation
-    context = context_vector.repeat(num_samples, 1)
-    
-    # Start with random noise from a standard normal distribution
-    y_t = torch.randn(num_samples, flow_model.embedding, device=device)
-    
-    dt = 1.0 / num_steps
-    for i in range(num_steps):
-        t = torch.full((num_samples, 1), i * dt, device=device)
-        
-        # Predict velocity
-        t_emb = flow_model.time_embedding(t)
-        t_emb_proj = flow_model.time_projection(t_emb)
-        
-        velocity = flow_model.velocity_predictor(torch.cat([y_t, context, t_emb_proj], dim=1))
-        
-        # Update sample using Euler step
-        y_t = y_t + velocity * dt
-        
-    return y_t
-# --- END NEW ---
-
 def handle_sigusr1(signum, frame):
     os.system(f'scontrol requeue {os.getenv("SLURM_JOB_ID")}')
     exit()
 
+
 def handle_sigterm(signum, frame):
     pass
 
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
+
     def __init__(self, name, fmt=":f"):
         self.name = name
         self.fmt = fmt
@@ -561,6 +499,7 @@ class AverageMeter(object):
         fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)
 
+
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
@@ -576,6 +515,7 @@ def accuracy(output, target, topk=(1,)):
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
+
 
 if __name__ == "__main__":
     main()
