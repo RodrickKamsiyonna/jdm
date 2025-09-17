@@ -73,22 +73,31 @@ def main():
     args.world_size = args.ngpus_per_node
     torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
     
-def apply_transforms(batch):
-    """Applies transforms to a batch of examples."""
-    transform = transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-            ),
-        ]
-    )
-    # The .convert("RGB") is important for images that might be grayscale
-    batch["image"] = [transform(img.convert("RGB")) for img in batch["jpg"]] 
-    batch["label"] = batch["cls"]
-    return batch
+# Add this after your imports at the top of the file
+from functools import partial
+
+# This function is now at the top-level, so it can be pickled.
+def apply_transforms(example, transform):
+    """
+    Apply transforms to a single example from the Hugging Face dataset.
+
+    Parameters:
+        example (dict): A dictionary with keys like "jpg" and "cls".
+        transform (torchvision.transforms): The torchvision transform pipeline.
+
+    Returns:
+        dict: A dictionary with keys "image" (transformed tensor) 
+              and "label" (class id).
+    """
+    # Apply the transform to the image, converting to RGB first
+    transformed_image = transform(example["jpg"].convert("RGB"))
+
+    # Return a dictionary with the keys your training loop expects
+    return {
+        "image": transformed_image,
+        "label": example["cls"]
+    }
+
 
 
 def main_worker(gpu, args):
@@ -139,7 +148,7 @@ def main_worker(gpu, args):
             ),
         ]
     )
-
+    transforms_func = partial(apply_transforms, transform=transform)
     if args.rank == 0:
         print("Streaming ImageNet data from 'timm/imagenet-1k-wds' on Hugging Face Hub...")
 
@@ -147,14 +156,14 @@ def main_worker(gpu, args):
     train_dataset = (
         load_dataset("timm/imagenet-1k-wds", split="train", streaming=True)
         .shard(num_shards=args.world_size, index=args.rank)
-        .map(apply_transforms, remove_columns=["jpg", "cls"])
+        .map(transforms_func, remove_columns=["jpg", "cls"])
     )
 
     # Load and shard the validation dataset
     val_dataset = (
         load_dataset("timm/imagenet-1k-wds", split="validation", streaming=True)
         .shard(num_shards=args.world_size, index=args.rank)
-        .map(apply_transforms, remove_columns=["jpg", "cls"])
+        .map(transforms_func, remove_columns=["jpg", "cls"])
     )
     
     kwargs = dict(
