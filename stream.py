@@ -97,25 +97,20 @@ def get_arguments():
 
     return parser
 
+# Add this after your imports at the top of the file
+from functools import partial
+
+# This function is now at the top-level, so it can be pickled.
 def apply_transforms(example, transform):
     """
     Apply transforms to a single example from the Hugging Face dataset.
-    Args:
-        example (dict): A dictionary representing a single dataset example,
-                        containing keys like 'jpg' and 'cls'.
-        transform (callable): The torchvision transform to apply.
-    Returns:
-        dict: The transformed example dictionary with the image processed
-              and potentially renamed to 'image'.
+    Takes a dictionary `example` and a torchvision `transform` pipeline.
     """
-    # 'example["jpg"]' is a single PIL Image (e.g., JpegImageFile)
-    # Apply the transform to this single image
+    # Apply the transform to the image, converting to RGB first
     transformed_image = transform(example["jpg"].convert("RGB"))
     
-    # Return a dictionary containing the transformed image and the label
-    # You can keep the original key names or change them as needed
-    # Here, we change 'jpg' -> 'image' and 'cls' -> 'label' to match later usage
-    return {"image": transformed_image, "label": example["cls"]}
+    # Return a dictionary with the keys your training loop expects
+    return {"image": transformed_image, "label": example["cls"]}    return {"image": transformed_image, "label": example["cls"]}
     
 def main():
     parser = get_arguments()
@@ -233,18 +228,20 @@ def main_worker(gpu, args):
 
     if args.rank == 0:
         print("Streaming ImageNet data from 'timm/imagenet-1k-wds' on Hugging Face Hub...")
+    train_transforms_func = partial(apply_transforms, transform=train_transform)
+    val_transforms_func = partial(apply_transforms, transform=val_transform)
 
     # Load and shard the training dataset for distributed training
     train_dataset = (
         load_dataset("timm/imagenet-1k-wds", split="train", streaming=True)
         .shard(num_shards=args.world_size, index=args.rank)
-        .map(apply_train_transforms) # Use with_transform (or set_transform)
+        .map(train_transforms_func, remove_columns=["jpg", "cls"]) # remove old columns
     )
 
     # Load the full validation dataset (it will only be used by rank 0)
     val_dataset = (
         load_dataset("timm/imagenet-1k-wds", split="validation", streaming=True)
-        .map(apply_val_transforms) # Use with_transform (or set_transform)
+        .map(val_transforms_func, remove_columns=["jpg", "cls"]) # remove old columns
     )
     
     kwargs = dict(
