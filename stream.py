@@ -23,6 +23,22 @@ from datasets import load_dataset
 
 import resnet
 
+from PIL import Image, TiffImagePlugin
+
+# --- Add this snippet to fix the crash ---
+# Monkey-patch PIL to be robust to corrupt EXIF data and truncated images
+_original_getexif = Image.Image.getexif
+
+def patched_getexif(self):
+    try:
+        return _original_getexif(self)
+    except (AttributeError, TiffImagePlugin.TiffImageError, UnicodeDecodeError):
+        # Catch errors that occur when reading corrupt EXIF data
+        return None
+
+Image.Image.getexif = patched_getexif
+Image.LOAD_TRUNCATED_IMAGES = True
+# --- End of snippet ---
 
 def get_arguments():
     parser = argparse.ArgumentParser(
