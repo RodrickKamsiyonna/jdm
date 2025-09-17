@@ -192,7 +192,7 @@ def main_worker(gpu, args):
 
     # --- FEATURE EXTRACTION ---
     print(f"Rank {args.rank}: Starting feature extraction for the training set...")
-    train_features, train_labels = extract_features(model, train_loader, gpu, args)
+    extract_features(model, train_loader, gpu, args,split='train')
     
     # Save features and labels for the current rank's shard
     torch.save(train_features, args.save_dir / f"train_features_rank_{args.rank}.pt")
@@ -203,11 +203,9 @@ def main_worker(gpu, args):
     torch.distributed.barrier()
 
     print(f"Rank {args.rank}: Starting feature extraction for the validation set...")
-    val_features, val_labels = extract_features(model, val_loader, gpu, args)
+    extract_features(model, val_loader, gpu, args,split='val')
     
     # Save features and labels for the current rank's shard
-    torch.save(val_features, args.save_dir / f"val_features_rank_{args.rank}.pt")
-    torch.save(val_labels, args.save_dir / f"val_labels_rank_{args.rank}.pt")
     print(f"Rank {args.rank}: Saved validation features and labels.")
 
     if args.rank == 0:
@@ -217,34 +215,23 @@ def main_worker(gpu, args):
         print("You will need to load and concatenate these files to get the full dataset.")
 
 
-def extract_features(model, loader, gpu, args):
-    """
-    Iterates over a dataloader, extracts features using the model, and returns
-    the features and labels as concatenated tensors.
-    """
-    features_list = []
-    labels_list = []
-    
-    # Use tqdm for a progress bar if it's rank 0
-    iterable_loader = tqdm(loader, desc="Extracting", disable=(args.rank != 0))
+def extract_features(model, loader, gpu, args, split="train"):
+    save_dir = args.save_dir / split
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
-        for batch in iterable_loader:
+        for i, batch in enumerate(tqdm(loader, desc=f"Extracting {split}", disable=(args.rank != 0))):
             images = batch["image"].cuda(gpu, non_blocking=True)
             labels = batch["label"]
-            
-            # Get features from the model
+
+            # Forward pass
             features = model(images)
 
-            # Append features and labels to lists (move to CPU to save GPU memory)
-            features_list.append(features.detach().cpu())
-            labels_list.append(labels.cpu())
-
-    # Concatenate all features and labels from the lists
-    all_features = torch.cat(features_list, dim=0)
-    all_labels = torch.cat(labels_list, dim=0)
-    
-    return all_features, all_labels
+            # Save immediately (one shard per batch)
+            torch.save(
+                {"features": features.cpu(), "labels": labels.cpu()},
+                save_dir / f"rank{args.rank}_batch{i:05d}.pt"
+            )
 
 
 # --- Helper functions (unchanged from original) ---
