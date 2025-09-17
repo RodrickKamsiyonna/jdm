@@ -96,12 +96,27 @@ def get_arguments():
     )
 
     return parser
-    
-def apply_transforms(batch, transform):
-        """Apply transforms to a batch from the Hugging Face dataset."""
-        batch["image"] = [transform(img.convert("RGB")) for img in batch["jpg"]]
-        return {"image": batch["image"], "label": batch["cls"]}
 
+def apply_transforms(example, transform):
+    """
+    Apply transforms to a single example from the Hugging Face dataset.
+    Args:
+        example (dict): A dictionary representing a single dataset example,
+                        containing keys like 'jpg' and 'cls'.
+        transform (callable): The torchvision transform to apply.
+    Returns:
+        dict: The transformed example dictionary with the image processed
+              and potentially renamed to 'image'.
+    """
+    # 'example["jpg"]' is a single PIL Image (e.g., JpegImageFile)
+    # Apply the transform to this single image
+    transformed_image = transform(example["jpg"].convert("RGB"))
+    
+    # Return a dictionary containing the transformed image and the label
+    # You can keep the original key names or change them as needed
+    # Here, we change 'jpg' -> 'image' and 'cls' -> 'label' to match later usage
+    return {"image": transformed_image, "label": example["cls"]}
+    
 def main():
     parser = get_arguments()
     args = parser.parse_args()
