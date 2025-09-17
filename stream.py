@@ -211,12 +211,12 @@ def main_worker(gpu, args):
     # Load and shard the training dataset for distributed training
     train_dataset = load_dataset(
         "timm/imagenet-1k-wds", split="train", streaming=True
-    ).shard(num_shards=args.world_size, index=args.rank).with_transform(train_transforms_func)
+    ).shard(num_shards=args.world_size, index=args.rank).map(train_transforms_func)
 
     # Load the full validation dataset (it will only be used by rank 0)
     val_dataset = load_dataset(
         "timm/imagenet-1k-wds", split="validation", streaming=True
-    ).with_transform(val_transforms_func)
+    ).map(val_transforms_func)
     
     # --- Removed old ImageFolder and file-based subset logic ---
 
