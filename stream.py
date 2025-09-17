@@ -32,7 +32,7 @@ _original_getexif = Image.Image.getexif
 def patched_getexif(self):
     try:
         return _original_getexif(self)
-    except (AttributeError, TiffImagePlugin.TiffImageError, UnicodeDecodeError):
+    except (AttributeError, UnicodeDecodeError):
         # Catch errors that occur when reading corrupt EXIF data
         return None
 
