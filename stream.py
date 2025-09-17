@@ -110,7 +110,7 @@ def apply_transforms(example, transform):
     transformed_image = transform(example["jpg"].convert("RGB"))
     
     # Return a dictionary with the keys your training loop expects
-    return {"image": transformed_image, "label": example["cls"]}    return {"image": transformed_image, "label": example["cls"]}
+    return {"image": transformed_image, "label": example["cls"]} 
     
 def main():
     parser = get_arguments()
