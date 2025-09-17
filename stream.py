@@ -123,11 +123,22 @@ def main_worker(gpu, args):
         ]
     )
     
-    def apply_transforms(batch):
-        """Applies transforms to a batch of examples."""
-        batch["image"] = [transform(img.convert("RGB")) for img in batch["jpg"]]
-        batch["label"] = batch["cls"]
-        return batch
+def apply_transforms(batch):
+    """Applies transforms to a batch of examples."""
+    transform = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            ),
+        ]
+    )
+    batch["image"] = [transform(img.convert("RGB")) for img in batch["jpg"]]
+    batch["label"] = batch["cls"]
+    return batch
+
 
     if args.rank == 0:
         print("Streaming ImageNet data from 'timm/imagenet-1k-wds' on Hugging Face Hub...")
