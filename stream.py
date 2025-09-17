@@ -34,7 +34,7 @@ def patched_getexif(self):
         return _original_getexif(self)
     except (AttributeError, UnicodeDecodeError):
         # Catch errors that occur when reading corrupt EXIF data
-        return None
+        return  {}
 
 Image.Image.getexif = patched_getexif
 Image.LOAD_TRUNCATED_IMAGES = True
