@@ -192,11 +192,9 @@ def main_worker(gpu, args):
 
     # --- FEATURE EXTRACTION ---
     print(f"Rank {args.rank}: Starting feature extraction for the training set...")
-    extract_features(model, train_loader, gpu, args,split='train')
+   # extract_features(model, train_loader, gpu, args,split='train')
     
     # Save features and labels for the current rank's shard
-    torch.save(train_features, args.save_dir / f"train_features_rank_{args.rank}.pt")
-    torch.save(train_labels, args.save_dir / f"train_labels_rank_{args.rank}.pt")
     print(f"Rank {args.rank}: Saved training features and labels.")
 
     # Synchronize all processes before starting validation set extraction
