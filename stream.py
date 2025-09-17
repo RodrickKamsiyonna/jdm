@@ -96,7 +96,11 @@ def get_arguments():
     )
 
     return parser
-
+    
+def apply_transforms(batch, transform):
+        """Apply transforms to a batch from the Hugging Face dataset."""
+        batch["image"] = [transform(img.convert("RGB")) for img in batch["jpg"]]
+        return {"image": batch["image"], "label": batch["cls"]}
 
 def main():
     parser = get_arguments()
@@ -195,11 +199,6 @@ def main_worker(gpu, args):
             normalize,
         ]
     )
-
-    def apply_transforms(batch, transform):
-        """Apply transforms to a batch from the Hugging Face dataset."""
-        batch["image"] = [transform(img.convert("RGB")) for img in batch["jpg"]]
-        return {"image": batch["image"], "label": batch["cls"]}
     
     # Create partial functions for transforms
     train_transforms_func = partial(apply_transforms, transform=train_transform)
