@@ -285,7 +285,7 @@ def adjust_learning_rate(args, optimizer, loader, step):
         step_adj = step - warmup_steps
         max_steps_adj = max_steps - warmup_steps
         q = 0.5 * (1 + math.cos(math.pi * step_adj / max_steps_adj))
-        end_lr = base_lr * 0.1
+        end_lr = base_lr * 0.001
         lr = base_lr * q + end_lr * (1 - q)
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
