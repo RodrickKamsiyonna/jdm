@@ -131,6 +131,8 @@ def main():
     args.world_size = args.ngpus_per_node
     torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
 
+def exclude_bias_and_norm(p):
+    return p.ndim == 1
 
 def main_worker(gpu, args):
     args.rank += gpu
