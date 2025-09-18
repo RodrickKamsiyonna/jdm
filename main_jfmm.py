@@ -79,6 +79,9 @@ def get_arguments():
 
     parser.add_argument("--ckpt-interval", type=int, default=10,
                         help="Save a full checkpoint every N epochs (master only). 0 = save every epoch")
+    
+    parser.add_argument("--resolution",type=int, default=224,
+                        help="Resolution of the Image")
 
     return parser
 
@@ -117,7 +120,7 @@ def main(args):
         print("wandb requested but not installed. Install via `pip install wandb` or unset --wandb-project.",
               file=sys.stderr)
 
-    transforms = aug.TrainTransform()
+    transforms = aug.TrainTransform(args.resolution)
 
     dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
