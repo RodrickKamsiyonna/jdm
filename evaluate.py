@@ -105,6 +105,12 @@ def get_arguments():
         help="Resolution of the image",
     )
     
+    parser.add_argument(
+        "--classes",
+        default=1000,
+        type=int,
+        help="Number of classes",
+    )
     return parser
 
 
@@ -154,7 +160,7 @@ def main_worker(gpu, args):
         }
     backbone.load_state_dict(state_dict, strict=False)
 
-    head = nn.Linear(embedding, 1000)
+    head = nn.Linear(embedding, args.classes)
     head.weight.data.normal_(mean=0.0, std=0.01)
     head.bias.data.zero_()
     model = nn.Sequential(backbone, head)
