@@ -296,6 +296,18 @@ class ResNet(nn.Module):
 
         return x
 
+def resnet18_mod(**kwargs):
+    model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs), 512
+    model.conv1 = nn.Conv2d(
+        3, 64,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        bias=False
+    )
+    model.maxpool = nn.Identity()  # removes the maxpool
+    return model, 512
+
 def resnet18(**kwargs):
     return ResNet(BasicBlock, [2, 2, 2, 2], **kwargs), 512
 
