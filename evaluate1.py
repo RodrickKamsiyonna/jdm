@@ -365,15 +365,14 @@ def main_worker(gpu, args):
                     acc1, acc5 = accuracy(output, target, topk=(1, 5))
                     top1.update(acc1[0].item(), images.size(0))
                     top5.update(acc5[0].item(), images.size(0))
-                    best_acc["top1"] = max(best_acc["top1"], top1.avg)
-                    best_acc["top5"] = max(best_acc["top5"], top5.avg)
-                    stats = dict(
-                        epoch=epoch,
-                        acc1=top1.avg,
-                        acc5=top5.avg,
-                        best_acc1=best_acc["top1"],
-                        best_acc5=best_acc["top5"],
-                    )
+            best_acc["top1"] = max(best_acc["top1"], top1.avg)
+            best_acc["top5"] = max(best_acc["top5"], top5.avg)
+            stats = dict(
+                epoch=epoch,
+                acc1=top1.avg,
+                acc5=top5.avg,
+                best_acc1=best_acc["top1"],
+                best_acc5=best_acc["top5"],)
             print(json.dumps(stats))
             print(json.dumps(stats), file=stats_file)
 
