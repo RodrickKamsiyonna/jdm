@@ -251,7 +251,7 @@ def main(args):
             if should_save:
                 state = dict(
                     epoch=epoch + 1,
-                    model=model.state_dict(),
+                    model=model.model.module.backbone.state_dict(),
                     optimizer=optimizer.state_dict(),
                 )
                 ckpt_path = args.exp_dir / "model.pth"
