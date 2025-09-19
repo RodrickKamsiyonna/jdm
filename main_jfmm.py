@@ -249,11 +249,7 @@ def main(args):
 
             should_save = save_every_epoch or ((epoch + 1) % ckpt_interval == 0)
             if should_save:
-                state = dict(
-                    epoch=epoch + 1,
-                    model=model.module.backbone.state_dict(),
-                    optimizer=optimizer.state_dict(),
-                )
+                state = model.module.backbone.state_dict()
                 ckpt_path = args.exp_dir / "model.pth"
                 torch.save(state, ckpt_path)
 
