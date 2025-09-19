@@ -144,7 +144,7 @@ def extract_features(loader, model, gpu):
     targets = []
     for images, target in loader:
         images = images.cuda(gpu, non_blocking=True)
-        feat = model[0](images)  # Only backbone
+        feat = model.module[0](images)  # Only backbone
         features.append(feat.cpu())
         targets.append(target)
     features = torch.cat(features)
