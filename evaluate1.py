@@ -279,7 +279,9 @@ def main_worker(gpu, args):
         train_dataset, sampler=train_sampler, **kwargs
     )
     features, targets = extract_features(train_loader_for_features, model, gpu)
-
+    
+    features = features.cuda(gpu)
+    targets = targets.cuda(gpu)
     # Gather features from all GPUs
     features_list = [torch.zeros_like(features) for _ in range(args.world_size)]
     torch.distributed.all_gather(features_list, features)
