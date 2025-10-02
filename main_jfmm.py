@@ -144,14 +144,11 @@ def main(args):
     model = torch.nn.parallel.DistributedDataParallel(
         model, device_ids=[gpu], find_unused_parameters=False, gradient_as_bucket_view=True
     )
-
-    optimizer = LARS(
-        model.parameters(),
-        lr=0,
-        weight_decay=args.wd,
-        weight_decay_filter=exclude_bias_and_norm,
-        lars_adaptation_filter=exclude_bias_and_norm,
-    )
+    optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=args.lr,
+    weight_decay=args.wd,
+    betas=(0.9, 0.999), )
 
     if (args.exp_dir / "model.pth").is_file():
         if args.rank == 0:
@@ -281,7 +278,7 @@ def adjust_learning_rate(args, optimizer, loader, step):
         step_adj = step - warmup_steps
         max_steps_adj = max_steps - warmup_steps
         q = 0.5 * (1 + math.cos(math.pi * step_adj / max_steps_adj))
-        end_lr = base_lr * 0.001
+        end_lr = base_lr * 0.01
         lr = base_lr * q + end_lr * (1 - q)
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
