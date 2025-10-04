@@ -245,7 +245,7 @@ def main_worker(gpu, args):
         valdir,
         transforms.Compose(
             [
-                transforms.Resize(args.resolution, args.resolution),
+                transforms.Resize((args.resolution, args.resolution)),
                 transforms.ToTensor(),
                 normalize,
             ]
