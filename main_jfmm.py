@@ -144,9 +144,10 @@ def main(args):
     model = torch.nn.parallel.DistributedDataParallel(
         model, device_ids=[gpu], find_unused_parameters=False, gradient_as_bucket_view=True
     )
+    base_lr = args.base_lr * args.batch_size / 256
     optimizer = torch.optim.AdamW(
     model.parameters(),
-    lr=args.lr,
+    lr=base_lr,
     weight_decay=args.wd,
     betas=(0.9, 0.999), )
 
