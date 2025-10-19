@@ -235,7 +235,7 @@ def main_worker(gpu, args):
                 (traindir / cls / fname, train_dataset.class_to_idx[cls])
             )
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, drop_last=True)
     kwargs = dict(
         batch_size=args.batch_size // args.world_size,
         num_workers=args.workers,
