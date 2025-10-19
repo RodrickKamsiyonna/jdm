@@ -185,7 +185,7 @@ def main_worker(gpu, args):
 
     # automatically resume from checkpoint if it exists
     if (args.exp_dir / "checkpoint.pth").is_file():
-        ckpt = torch.load(args.exp_dir / "checkpoint.pth", map_location="cpu")
+        ckpt = torch.load(args.exp_dir / "checkpoint.pth", map_location="cpu", weights_only=False)
         start_epoch = ckpt["epoch"]
         best_acc = ckpt["best_acc"]
         model.load_state_dict(ckpt["model"])
