@@ -24,6 +24,7 @@ import resnet
 
 
 def get_arguments():
+    """Parses command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Evaluate a pretrained model on ImageNet"
     )
@@ -132,39 +133,6 @@ def main():
     torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
 
 
-def exclude_bias_and_norm(p):
-    return p.ndim == 1
-
-
-@torch.no_grad()
-def extract_features(loader, model, gpu):
-    """Extract features from the backbone."""
-    model.eval()
-    features = []
-    targets = []
-    for images, target in loader:
-        images = images.cuda(gpu, non_blocking=True)
-        feat = model.module[0](images)  # Only backbone
-        features.append(feat.cpu())
-        targets.append(target)
-    features = torch.cat(features)
-    targets = torch.cat(targets)
-    return features, targets
-
-
-def compute_mean_std(features):
-    """Compute mean and std for each feature dimension."""
-    mean = features.mean(dim=0)
-    std = features.std(dim=0)
-    std += 1e-9  # avoid division by zero
-    return mean, std
-
-
-def standardize_features(features, mean, std):
-    """Standardize features using given mean and std."""
-    return (features - mean) / std
-
-
 def main_worker(gpu, args):
     args.rank += gpu
     torch.distributed.init_process_group(
@@ -184,7 +152,7 @@ def main_worker(gpu, args):
     torch.backends.cudnn.benchmark = True
 
     backbone, embedding = resnet.__dict__[args.arch](zero_init_residual=True)
-    state_dict = torch.load(args.pretrained, map_location="cpu", weights_only=False)
+    state_dict = torch.load(args.pretrained, map_location="cpu")
     if "model" in state_dict:
         state_dict = state_dict["model"]
         state_dict = {
@@ -202,19 +170,22 @@ def main_worker(gpu, args):
     if args.weights == "freeze":
         backbone.requires_grad_(False)
         head.requires_grad_(True)
+    
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
     criterion = nn.CrossEntropyLoss().cuda(gpu)
 
     param_groups = [dict(params=head.parameters(), lr=args.lr_head)]
     if args.weights == "finetune":
+        # Finetuning is less common for linear eval, but supported
         param_groups.append(dict(params=backbone.parameters(), lr=args.lr_backbone))
+    
     optimizer = optim.SGD(param_groups, 0, momentum=0.9, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
     # automatically resume from checkpoint if it exists
     if (args.exp_dir / "checkpoint.pth").is_file():
-        ckpt = torch.load(args.exp_dir / "checkpoint.pth", map_location="cpu", weights_only=False)
+        ckpt = torch.load(args.exp_dir / "checkpoint.pth", map_location="cpu")
         start_epoch = ckpt["epoch"]
         best_acc = ckpt["best_acc"]
         model.load_state_dict(ckpt["model"])
@@ -223,6 +194,7 @@ def main_worker(gpu, args):
     else:
         start_epoch = 0
         best_acc = {"top1": 0, "top5": 0}
+
     # Data loading code
     traindir = args.data_dir / "train"
     valdir = args.data_dir / "val"
@@ -245,7 +217,7 @@ def main_worker(gpu, args):
         valdir,
         transforms.Compose(
             [
-                transforms.Resize((args.resolution, args.resolution)),
+                transforms.Resize((args.resolution,args.resolution)),
                 transforms.ToTensor(),
                 normalize,
             ]
@@ -272,67 +244,106 @@ def main_worker(gpu, args):
     )
     val_loader = torch.utils.data.DataLoader(val_dataset, **kwargs)
 
-    # Extract features and compute mean/std
-    print("Extracting features from backbone...")
-    train_loader_for_features = torch.utils.data.DataLoader(
-        train_dataset, sampler=train_sampler, **kwargs
-    )
-    features, targets = extract_features(train_loader_for_features, model, gpu)
-    
-    features = features.cuda(gpu)
-    targets = targets.cuda(gpu)
-    # Gather features from all GPUs
-    features_list = [torch.zeros_like(features) for _ in range(args.world_size)]
-    torch.distributed.all_gather(features_list, features)
-    features = torch.cat(features_list)
-
-    targets_list = [torch.zeros_like(targets) for _ in range(args.world_size)]
-    torch.distributed.all_gather(targets_list, targets)
-    targets = torch.cat(targets_list)
-
-    # Compute mean and std on rank 0
+    # =================================================================================
+    # ==> Step 1: Extract features, compute mean/std, and cache them.
+    # This is done only ONCE before training starts.
+    # =================================================================================
     if args.rank == 0:
-        print("Computing mean and std of features...")
-        mean, std = compute_mean_std(features)
-    else:
-        mean, std = None, None
-
-    # Broadcast mean and std to all GPUs
-    if args.rank == 0:
-        mean = mean.cuda(gpu)
-        std = std.cuda(gpu)
-    else:
-        mean = torch.zeros(features.shape[1]).cuda(gpu)
-        std = torch.ones(features.shape[1]).cuda(gpu)
+        print("Extracting features from backbone...")
     
+    # Set model to eval mode for feature extraction
+    model.eval() 
+    
+    all_features = []
+    all_targets = []
+    with torch.no_grad():
+        for images, target in train_loader:
+            images = images.cuda(gpu, non_blocking=True)
+            # Extract features from the backbone (model.module[0])
+            feat = model.module[0](images)
+            all_features.append(feat)
+            all_targets.append(target)
+
+    # Gather features and targets from all GPUs
+    # This creates a list of tensors, where each tensor is from one GPU
+    features_from_all_gpus = [torch.zeros_like(all_features[0]) for _ in range(args.world_size)]
+    targets_from_all_gpus = [torch.zeros_like(all_targets[0]) for _ in range(args.world_size)]
+    
+    # Concatenate local features before gathering
+    local_features = torch.cat(all_features)
+    local_targets = torch.cat(all_targets)
+
+    # `all_gather` requires input tensors to be of the same size across processes.
+    # This requires careful handling if the dataset size isn't perfectly divisible
+    # by (batch_size * world_size). A common solution is to pad, but for simplicity,
+    # we assume divisibility, which DistributedSampler often handles.
+    torch.distributed.all_gather(features_from_all_gpus, local_features)
+    torch.distributed.all_gather(targets_from_all_gpus, local_targets.cuda(gpu))
+
+    # Concatenate features from all GPUs to form the full training set
+    train_features = torch.cat(features_from_all_gpus).cpu()
+    train_targets = torch.cat(targets_from_all_gpus).cpu()
+
+    # Compute mean and std on rank 0, then broadcast
+    if args.rank == 0:
+        print("Computing mean and standard deviation...")
+        mean = train_features.mean(dim=0)
+        std = train_features.std(dim=0)
+        std += 1e-6 # Avoid division by zero
+    else:
+        # Create empty tensors on other ranks to receive the broadcast
+        mean = torch.zeros(train_features.shape[1])
+        std = torch.ones(train_features.shape[1])
+    
+    # Broadcast mean and std to all processes
     torch.distributed.broadcast(mean, src=0)
     torch.distributed.broadcast(std, src=0)
 
+    # Standardize the features
+    train_features = (train_features - mean) / std
+
+    # =================================================================================
+    # ==> Step 2: Create a new DataLoader from the cached features.
+    # =================================================================================
+    # This loader will yield pre-computed, normalized features and targets.
+    feature_dataset = torch.utils.data.TensorDataset(train_features, train_targets)
+    feature_sampler = torch.utils.data.distributed.DistributedSampler(feature_dataset)
+    feature_loader = torch.utils.data.DataLoader(
+        feature_dataset, sampler=feature_sampler, **kwargs
+    )
+    
+    # Move mean and std to the current GPU for use in validation
+    mean = mean.cuda(gpu)
+    std = std.cuda(gpu)
+
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
-        # train
-        if args.weights == "finetune":
-            model.train()
-        elif args.weights == "freeze":
-            model.eval()
-        else:
-            assert False
-        train_sampler.set_epoch(epoch)
-        for step, (images, target) in enumerate(
-            train_loader, start=epoch * len(train_loader)
+        # Set the sampler epoch to ensure proper shuffling
+        feature_sampler.set_epoch(epoch)
+
+        # For linear evaluation, only the head is trained.
+        # Set backbone to eval mode, head to train mode.
+        model.module[0].eval() # Backbone
+        model.module[1].train() # Head
+
+        # =================================================================================
+        # ==> Step 3: Train using the feature loader.
+        # Notice we are NOT passing images through the backbone here.
+        # =================================================================================
+        for step, (features, target) in enumerate(
+            feature_loader, start=epoch * len(feature_loader)
         ):
-            images = images.cuda(gpu, non_blocking=True)
+            features = features.cuda(gpu, non_blocking=True)
             target = target.cuda(gpu, non_blocking=True)
-
-            with torch.no_grad():
-                feat = model.module[0](images)  # backbone
-                feat = (feat - mean) / std  # standardize
-
-            output = model.module[1](feat)  # linear head
+            
+            # Forward pass is ONLY through the linear head
+            output = model.module[1](features)
+            
             loss = criterion(output, target)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
             if step % args.print_freq == 0:
                 torch.distributed.reduce(loss.div_(args.world_size), 0)
                 if args.rank == 0:
@@ -359,12 +370,17 @@ def main_worker(gpu, args):
                 for images, target in val_loader:
                     images = images.cuda(gpu, non_blocking=True)
                     target = target.cuda(gpu, non_blocking=True)
-                    feat = model.module[0](images)  # backbone
-                    feat = (feat - mean) / std  # standardize
-                    output = model.module[1](feat)  # linear head
+                    
+                    # Evaluation still requires the full forward pass
+                    feat = model.module[0](images)
+                    # Normalize with training set statistics
+                    feat = (feat - mean) / std
+                    output = model.module[1](feat)
+                    
                     acc1, acc5 = accuracy(output, target, topk=(1, 5))
                     top1.update(acc1[0].item(), images.size(0))
                     top5.update(acc5[0].item(), images.size(0))
+            
             best_acc["top1"] = max(best_acc["top1"], top1.avg)
             best_acc["top5"] = max(best_acc["top5"], top5.avg)
             stats = dict(
@@ -372,7 +388,8 @@ def main_worker(gpu, args):
                 acc1=top1.avg,
                 acc5=top5.avg,
                 best_acc1=best_acc["top1"],
-                best_acc5=best_acc["top5"],)
+                best_acc5=best_acc["top5"],
+            )
             print(json.dumps(stats))
             print(json.dumps(stats), file=stats_file)
 
