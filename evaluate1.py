@@ -152,7 +152,7 @@ def main_worker(gpu, args):
     torch.backends.cudnn.benchmark = True
 
     backbone, embedding = resnet.__dict__[args.arch](zero_init_residual=True)
-    state_dict = torch.load(args.pretrained, map_location="cpu")
+    state_dict = torch.load(args.pretrained, map_location="cpu", weights_only=False)
     if "model" in state_dict:
         state_dict = state_dict["model"]
         state_dict = {
