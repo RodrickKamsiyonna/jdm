@@ -145,12 +145,13 @@ def main(args):
         model, device_ids=[gpu], find_unused_parameters=False, gradient_as_bucket_view=True
     )
     base_lr = args.base_lr * args.batch_size / 256
-    optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=base_lr,
-    weight_decay=args.wd,
-    betas=(0.9, 0.999), )
-
+    optimizer =  = LARS(
+        model.parameters(),
+        lr=0,
+        weight_decay=args.wd,
+        weight_decay_filter=exclude_bias_and_norm,
+        lars_adaptation_filter=exclude_bias_and_norm,
+    ) 
     if (args.exp_dir / "model.pth").is_file():
         if args.rank == 0:
             print("resuming from checkpoint")
