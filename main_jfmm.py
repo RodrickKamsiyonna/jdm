@@ -145,7 +145,7 @@ def main(args):
         model, device_ids=[gpu], find_unused_parameters=False, gradient_as_bucket_view=True
     )
     base_lr = args.base_lr * args.batch_size / 256
-    optimizer =  = LARS(
+    optimizer =  LARS(
         model.parameters(),
         lr=0,
         weight_decay=args.wd,
