@@ -1,10 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
-
 from PIL import ImageOps, ImageFilter
 import numpy as np
 import torchvision.transforms as transforms
@@ -35,11 +32,24 @@ class Solarization(object):
 
 
 class TrainTransform(object):
-    def __init__(self, resolution):
-        self.transform = transforms.Compose(
+    def __init__(self, resolution, local_crops_number=8):
+        """
+        Args:
+            resolution: Resolution for global crops
+            local_crops_number: Number of local crops (default: 8)
+        """
+        self.local_crops_number = local_crops_number
+        
+        local_crops_scale = (0.05, 0.4)
+        global_crops_scale = (0.4, 1.0)
+        
+        # Global transformations (2 crops)
+        self.global_transform_1 = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    resolution, interpolation=InterpolationMode.BICUBIC
+                    resolution, 
+                    scale=global_crops_scale,
+                    interpolation=InterpolationMode.BICUBIC
                 ),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomApply(
@@ -54,16 +64,19 @@ class TrainTransform(object):
                 GaussianBlur(p=1.0),
                 Solarization(p=0.0),
                 transforms.ToTensor(),
-                transforms.Lambda(lambda x: x.repeat(3,1,1) if x.size(0)==1 else x),
+                transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
                 ),
             ]
         )
-        self.transform_prime = transforms.Compose(
+        
+        self.global_transform_2 = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
-                    resolution, interpolation=InterpolationMode.BICUBIC
+                    resolution,
+                    scale=global_crops_scale,
+                    interpolation=InterpolationMode.BICUBIC
                 ),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomApply(
@@ -78,7 +91,37 @@ class TrainTransform(object):
                 GaussianBlur(p=0.1),
                 Solarization(p=0.2),
                 transforms.ToTensor(),
-                transforms.Lambda(lambda x: x.repeat(3,1,1) if x.size(0)==1 else x),
+                transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                ),
+            ]
+        )
+        
+        # Local transformations (8 crops at lower resolution)
+        # Typically local crops are at 96x96 or resolution//2
+        local_resolution = resolution // 2
+        
+        self.local_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(
+                    local_resolution,
+                    scale=local_crops_scale,
+                    interpolation=InterpolationMode.BICUBIC
+                ),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomApply(
+                    [
+                        transforms.ColorJitter(
+                            brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1
+                        )
+                    ],
+                    p=0.8,
+                ),
+                transforms.RandomGrayscale(p=0.2),
+                GaussianBlur(p=0.5),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
                 ),
@@ -86,6 +129,11 @@ class TrainTransform(object):
         )
 
     def __call__(self, sample):
-        x1 = self.transform(sample)
-        x2 = self.transform_prime(sample)
-        return x1, x2
+        # Generate 2 global crops
+        global_crop_1 = self.global_transform_1(sample)
+        global_crop_2 = self.global_transform_2(sample)
+        
+        # Generate local_crops_number local crops (default: 8)
+        local_crops = [self.local_transform(sample) for _ in range(self.local_crops_number)]
+        
+        return [global_crop_1, global_crop_2] + local_crops
