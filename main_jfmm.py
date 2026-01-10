@@ -3,7 +3,9 @@
 # All rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
+# Optimized for TPU v4 (8 cores) training with torch_xla
+#
 from pathlib import Path
 import argparse
 import json
@@ -62,7 +64,7 @@ def get_arguments():
     parser.add_argument("--wd", type=float, default=1e-6,
                         help="Weight decay")
     parser.add_argument("--num-workers", type=int, default=8,
-                        help="Number of dataloader workers")
+                        help="Number of dataloader workers per TPU core")
     parser.add_argument("--wandb-project", default=None,
                         help="W&B project name (if provided, wandb will be initialized on rank 0 after 'wandb login')")
     parser.add_argument("--wandb-entity", default=None,
@@ -132,7 +134,9 @@ def _mp_fn(index, args):
         sampler=train_sampler,
         num_workers=args.num_workers,
         drop_last=True,
-        pin_memory=False  # TPU doesn't need pin_memory
+        pin_memory=False,  # TPU doesn't need pin_memory
+        persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=2 if args.num_workers > 0 else None
     )
     
     # Wrap with ParallelLoader for XLA
