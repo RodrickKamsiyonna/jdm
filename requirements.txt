@@ -1,7 +1,7 @@
 torch>=2.0.0
 torchvision>=0.15.0
-numpy
-pillow
-wandb
-submitit
-datasets
+Pillow>=9.0.0
+numpy>=1.21.0
+wandb>=0.15.0
+google-cloud-storage>=2.0.0
+gcsfs>=2023.1.0
